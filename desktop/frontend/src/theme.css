@@ -1,0 +1,116 @@
+/* ArkPerf 桌面前端的设计 token。
+ *
+ * 设计语言学自 Reasonix 的桌面端：单列居中、开发者密度、终端质感。
+ * 关键约定：
+ *  - 深色为唯一主题（跟随 Webview 的 color-scheme）；
+ *  - 主色 #d97757（陶土橙），柔和变体用 color-mix 混合表面色而不是写死；
+ *  - 字号走 token（--text-*），组件里不写死 px；
+ *  - 不用 backdrop-filter/blur（各 WebView 实现差异大、还吃性能）。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 表面（由深到浅四级） */
+  --bg: #090a0c;
+  --bg-soft: #111319;
+  --bg-elev: #191b22;
+  --bg-elev-2: #222631;
+
+  /* 边框 */
+  --border: #343945;
+  --border-soft: #252a34;
+
+  /* 面板底色（侧栏 / 工作区，比主背景略亮半档） */
+  --sidebar-bg: #0c0e12;
+
+  /* 文本（正常 / 次要 / 弱化） */
+  --fg: #f4f5f7;
+  --fg-dim: #c0c4cc;
+  --fg-faint: #858b96;
+
+  /* 品牌 + 语义色 */
+  --accent: #d97757;
+  --accent-fg: #1a0f0a;
+  --accent-strong: #e58a6b;
+  --accent-soft: rgba(217, 119, 87, 0.14);
+  --ok: #74b87a;
+  --warn: #d9a441;
+  --err: #e0696a;
+  --link: #4b78ff;
+
+  /* 空态问候语的金色渐变（浅金 → 深金） */
+  --grad-greet: linear-gradient(100deg, #f0cd80 0%, #ddb254 55%, #cf9a3c 100%);
+
+  /* 用户消息气泡：主色轻微染色（和表面色混合，不会刺眼） */
+  --bubble-user-bg: color-mix(in srgb, var(--accent) 16%, var(--bg-elev-2));
+  --bubble-user-border: color-mix(in srgb, var(--accent) 28%, var(--border-soft));
+
+  /* 字号 token */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-base: 14px;
+  --text-lg: 15px;
+
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, "Liberation Mono",
+    Menlo, monospace;
+
+  /* 形状 */
+  --radius-card: 12px;
+  --radius-bubble: 22px;
+  --radius-row: 8px;
+  --shadow-card: 0 10px 28px rgba(0, 0, 0, 0.25);
+  --focus-ring: 0 0 0 3px var(--accent-soft);
+
+  /* 滚动条 */
+  --scrollbar-thumb: rgba(133, 139, 150, 0.4);
+  --scrollbar-thumb-hover: rgba(192, 196, 204, 0.55);
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--text-base)/1.7 var(--font-ui);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 转录内容要能被选中复制；交互控件自己再关掉 */
+* {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+button {
+  font: inherit;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 滚动条（WebView2 是 Chromium，-webkit- 前缀可用） */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 6px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}

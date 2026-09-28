@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    // "Node" 解析（即已废弃的 node10）在 TS 6 里已经是硬错误：
+    //   error TS5107: Option 'moduleResolution=node10' is deprecated
+    // 正确修法是换成 bundler（Vite 项目的标准），而不是用 ignoreDeprecations 压掉——
+    // 压制只是把同一个问题推到 TS 7。
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUnusedParameters": false,
+    "noImplicitAny": false,
+    "jsx": "preserve",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "lib": ["ESNext", "DOM"],
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.tsx", "src/**/*.vue", "bindings"]
+}

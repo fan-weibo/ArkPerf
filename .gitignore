@@ -30,3 +30,51 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# arkperf 构建产物
+bin/
+
+# hvigor 构建残留（构建或探测工具链时可能出现在工作目录）
+.hvigor/
+
+# 本地调试日志（诊断输出临时落盘）
+.build.log
+.smoke.log
+.mcp-*.log
+
+# arkperf build output
+bin/
+
+# local scratch logs
+.build.log
+.smoke.log
+.mglint-*.txt
+.cleanup.txt
+
+# ---- 以上单点列出之外的本地调试日志：全部点号 .log ----
+# （诊断用的临时输出，不进仓库）
+.*.log
+
+# ---- Python 缓存（mcp-servers/ 是 Python 服务）----
+__pycache__/
+*.pyc
+
+# ---- 虚拟环境：README 让队友在仓库里建 .venv，它属于本地环境 ----
+.venv/
+venv/
+
+# ---- mcp-servers 的测量产出物：跑一次就生成，不属于源码 ----
+mcp-servers/experience-report-*.json
+mcp-servers/experience-report-*.md
+mcp-servers/perflab_*.json
+mcp-servers/*-optimization-comparison-*.md
+mcp-servers/nyc_discover_baseline.jpeg
+
+# ---- 被当前版本取代的旧版服务脚本：留在本地看演进，不进仓库 ----
+# （同名的 core/server 两份并存，看代码的人分不清哪份在跑；真要看演进以本地为准）
+mcp-servers/legacy/
+
+# ---- 内部定位分析：不进公开仓库 ----
+# 它与另一个项目逐项对比，属于决策材料而非项目文档；
+# 公开后读者注意力会被引到别的项目上，对评委传达的也不是"自身设计"。
+docs/gap-vs-hmharness.md

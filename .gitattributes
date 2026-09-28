@@ -1,0 +1,30 @@
+# 行尾由仓库统一决定，不看各人机器的 core.autocrlf——
+# 队友在 Windows / macOS / Linux 上克隆应当得到相同的字节。
+#
+# 为什么必须有这个文件：仓库里有一份 Go + Python + Vue 的混合代码，
+# 如果行尾交给各人本机配置决定，"同一个文件在不同人机器上不一样"
+# 会让 git diff 出现整文件伪改动，脚本类文件还会真的坏掉
+# （比如 desktop/build/linux/*.sh 被拉成 CRLF 后执行报 bad interpreter）。
+* text=auto eol=lf
+
+# Windows 专有脚本保持 CRLF（cmd / PowerShell 对行尾敏感）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制：不做任何行尾或编码转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.car binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pyc binary

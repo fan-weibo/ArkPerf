@@ -1,0 +1,74 @@
+version: '3'
+
+vars:
+  APP_NAME: "arkperf-desktop"
+  BIN_DIR: "bin"
+  # 固定用 pnpm：这台机器 PATH 里有三套 npm（WorkBuddy 管理的 Node 22、
+  # C:\Program Files\nodejs、AppData\Roaming\npm），解析结果随调用方式而变——
+  # `wails3 doctor` 报 npm 12.0.2，PowerShell 报 10.9.7。构建要可复现，所以钉死一个。
+  PACKAGE_MANAGER: '{{.PACKAGE_MANAGER | default "pnpm"}}'
+  VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
+  # Target OS for build/package/run. Defaults to the host OS, and is overridden
+  # by `wails3 build GOOS=...` (or the GOOS env var) for cross-compilation. The
+  # tasks below dispatch to the matching platform Taskfile via this variable.
+  GOOS: '{{.GOOS | default OS}}'
+
+includes:
+  common: ./build/Taskfile.yml
+  windows: ./build/windows/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
+  linux: ./build/linux/Taskfile.yml
+  # iOS / Android（实验性移动端）资产已删除：桌面端用不到，
+  # 且会往仓库里塞 gradle wrapper 与 xcode 工程。将来要用：
+  #   wails3 update build-assets   然后补回这里的 include。
+
+tasks:
+  build:
+    summary: Builds the application
+    cmds:
+      - task: "{{.GOOS}}:build"
+
+  package:
+    summary: Packages a production build of the application
+    cmds:
+      - task: "{{.GOOS}}:package"
+
+  run:
+    summary: Runs the application
+    cmds:
+      - task: "{{.GOOS}}:run"
+
+  dev:
+    summary: Runs the application in development mode
+    cmds:
+      - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
+
+  install:msix:tools:
+    summary: Installs tools required for Windows MSIX packaging
+    cmds:
+      - task: windows:install:msix:tools
+
+  setup:docker:
+    summary: Builds Docker image for cross-compilation (~800MB download)
+    cmds:
+      - task: common:setup:docker
+
+  build:server:
+    summary: Builds the application in server mode (no GUI, HTTP server only)
+    cmds:
+      - task: common:build:server
+
+  run:server:
+    summary: Runs the application in server mode
+    cmds:
+      - task: common:run:server
+
+  build:docker:
+    summary: Builds a Docker image for server mode deployment
+    cmds:
+      - task: common:build:docker
+
+  run:docker:
+    summary: Builds and runs the Docker image
+    cmds:
+      - task: common:run:docker

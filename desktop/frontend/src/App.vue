@@ -1,0 +1,1086 @@
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+import { Events } from "@wailsio/runtime";
+import {
+  Service,
+  type BootstrapInfo,
+  type ToolInfo,
+  type SessionInfo,
+} from "../bindings/github.com/fan-weibo/ArkPerf/desktop";
+import SideBar from "./components/SideBar.vue";
+import WorkspacePanel from "./components/WorkspacePanel.vue";
+
+// 转录行模型。assistant 的 text 可能是 markdown，渲染时走 md()。
+// tool/result 的 text 分别是"参数串"与"输出全文"：
+// summary 显示首行，展开显示全文（模板和类型必须对齐，否则 TS 报错）。
+type Line =
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string }
+  | { kind: "tool"; text: string; name: string }
+  | { kind: "result"; text: string; name: string; isErr: boolean }
+  | { kind: "note"; text: string }
+  | { kind: "error"; text: string };
+
+marked.setOptions({ gfm: true, breaks: true });
+
+// 模型输出可能带任意内容（网页抓取、代码），innerHTML 前必须消毒，
+// 否则 XSS 能摸到 Wails 的绑定桥——桌面应用里这不是小事。
+function md(src: string): string {
+  return DOMPurify.sanitize(marked.parse(src) as string);
+}
+
+const boot = ref<BootstrapInfo | null>(null);
+const bootErr = ref("");
+const lines = ref<Line[]>([]);
+const tools = ref<ToolInfo[]>([]);
+const toolsLoaded = ref(false);
+const task = ref("");
+const running = ref(false);
+const toolCalls = ref(0);
+const approval = ref<{ id: string; name: string; args: string } | null>(null);
+const report = ref("");
+const streamEl = ref<HTMLElement | null>(null);
+const ta = ref<HTMLTextAreaElement | null>(null);
+
+// 侧栏数据
+const sessions = ref<SessionInfo[]>([]);
+
+// 视图路由：chat = 聊天；tools/toolchain/devices = 侧栏功能各自的页面。
+// 侧栏点功能是"跳转到页面"，不是弹框（用户明确的交互要求）——
+// 切回会话（点侧栏会话或新会话）就回到 chat 视图。
+const view = ref<"chat" | "tools" | "toolchain" | "devices">("chat");
+const toolFilter = ref("");
+const tcLoading = ref(false);
+const dvLoading = ref(false);
+
+const filteredTools = computed(() => {
+  const q = toolFilter.value.trim().toLowerCase();
+  if (!q) return tools.value;
+  return tools.value.filter(
+    (t) =>
+      t.Name.toLowerCase().includes(q) ||
+      t.Description.toLowerCase().includes(q) ||
+      t.Approval.toLowerCase().includes(q),
+  );
+});
+
+function openView(v: "tools" | "toolchain" | "devices") {
+  view.value = v;
+  // 进页面时自动拉数据：工具清单只拉一次，工具链/设备每次进入都刷新
+  if (v === "tools" && !toolsLoaded.value) loadTools();
+  if (v === "toolchain") checkToolchain();
+  if (v === "devices") listDevices();
+}
+
+function backToChat() {
+  view.value = "chat";
+}
+
+// 三栏宽度（可拖拽调整）
+const sideW = ref(210);
+const wsW = ref(240);
+const resizing = ref("");
+
+const unsubs: (() => void)[] = [];
+// 用户往上翻历史时不许拖拽跟底；滚回底部才恢复跟随
+const stick = ref(true);
+
+// 空态（金色问候 + 居中输入）的判据：出现过真正的对话内容才算开始。
+// note（"新会话…""已恢复…"）不算——否则落地页永远出不来。
+const hasConversation = computed(() =>
+  lines.value.some((l) => l.kind === "user" || l.kind === "assistant" || l.kind === "error"),
+);
+
+const curTitle = computed(() => {
+  const cur = sessions.value.find((s) => s.Current);
+  return cur?.Title ?? "新的会话";
+});
+
+function push(kind: Line["kind"], text: string, extra?: Partial<Line>) {
+  lines.value.push({ kind, text, ...extra } as Line);
+  toBottom();
+}
+
+function toBottom() {
+  if (!stick.value) return;
+  nextTick(() => {
+    const el = streamEl.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  });
+}
+
+function onScroll() {
+  const el = streamEl.value;
+  if (!el) return;
+  stick.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+}
+
+function fmtErr(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
+function firstLine(s: string): string {
+  const l = s.split("\n", 1)[0] ?? "";
+  return l.length > 120 ? l.slice(0, 120) + "…" : l;
+}
+
+function autoGrow() {
+  const el = ta.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 200) + "px";
+}
+
+onMounted(async () => {
+  // 先订事件再 Bootstrap：Bootstrap 要读配置、连 MCP，可能耗时几秒，
+  // 顺序反了这期间的事件会丢。
+  unsubs.push(
+    Events.On("arkperf:assistant", (ev) => {
+      push("assistant", ev.data);
+    }),
+    Events.On("arkperf:toolcall", (ev) => {
+      toolCalls.value++;
+      push("tool", ev.data.Args, { name: ev.data.Name });
+    }),
+    Events.On("arkperf:toolresult", (ev) =>
+      push("result", ev.data.Output, {
+        name: ev.data.Name,
+        isErr: ev.data.IsError,
+      }),
+    ),
+    Events.On("arkperf:approval:request", (ev) => {
+      approval.value = { id: ev.data.ID, name: ev.data.Name, args: ev.data.Args };
+    }),
+    Events.On("arkperf:approval:resolved", (ev) =>
+      push("note", `${ev.data.Granted ? "已批准" : "已拒绝"}：${ev.data.Name}`),
+    ),
+    Events.On("arkperf:done", (ev) => {
+      running.value = false;
+      approval.value = null;
+      if (ev.data.Err) {
+        push("error", `任务失败：${ev.data.Err}`);
+      } else {
+        push("note", `结束：${ev.data.Reason} · ${ev.data.Turns} 轮 · ${ev.data.ToolUses} 次工具调用`);
+      }
+    }),
+  );
+
+  try {
+    boot.value = await Service.Bootstrap();
+    if (boot.value.Restored) {
+      push("note", `已恢复上次会话：${boot.value.Turns} 轮 · ${boot.value.Updated}`);
+    }
+    await loadSessions();
+  } catch (e) {
+    bootErr.value = fmtErr(e);
+  }
+});
+
+onUnmounted(() => unsubs.forEach((f) => f()));
+
+async function loadSessions() {
+  try {
+    sessions.value = (await Service.ListSessions()) ?? [];
+  } catch {
+    sessions.value = []; // 侧栏失败不打断主流程
+  }
+}
+
+async function run() {
+  const text = task.value.trim();
+  if (!text || running.value) return;
+  task.value = "";
+  autoGrow();
+  push("user", text);
+  running.value = true;
+  toolCalls.value = 0;
+  try {
+    await Service.RunTask(text);
+  } catch (e) {
+    running.value = false;
+    push("error", fmtErr(e));
+  }
+}
+
+function onKey(e: KeyboardEvent) {
+  // isComposing：中文输入法的候选确认也是 Enter，绝不能当成"发送"
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    run();
+  }
+}
+
+async function interrupt() {
+  try {
+    await Service.Interrupt();
+    push("note", "已请求中断…");
+  } catch (e) {
+    push("error", fmtErr(e));
+  }
+}
+
+async function answer(allow: boolean) {
+  const cur = approval.value;
+  if (!cur) return;
+  approval.value = null;
+  try {
+    await Service.AnswerApproval(cur.id, allow);
+  } catch (e) {
+    push("error", fmtErr(e));
+  }
+}
+
+async function loadTools() {
+  try {
+    tools.value = (await Service.ListTools()) ?? [];
+    toolsLoaded.value = true;
+  } catch (e) {
+    push("error", fmtErr(e));
+  }
+}
+
+async function checkToolchain() {
+  tcLoading.value = true;
+  try {
+    report.value = await Service.CheckToolchain();
+  } catch (e) {
+    report.value = fmtErr(e);
+  } finally {
+    tcLoading.value = false;
+  }
+}
+
+async function listDevices() {
+  dvLoading.value = true;
+  try {
+    report.value = await Service.ListDevices();
+  } catch (e) {
+    report.value = fmtErr(e);
+  } finally {
+    dvLoading.value = false;
+  }
+}
+
+async function newSession() {
+  view.value = "chat"; // 从功能页点「新会话」也要回到聊天视图
+  try {
+    await Service.ResetSession();
+    lines.value = [];
+    report.value = "";
+    push("note", "已开始新会话：模型上下文已清空");
+    await loadSessions();
+  } catch (e) {
+    push("error", fmtErr(e));
+  }
+}
+
+async function onSwitch(id: string) {
+  // 先切视图再等数据：点了会话就该立刻回到聊天页，
+  // 历史转录加载完再填充（漏了这行就会"切了会话却还停在功能页"，实测撞过）
+  view.value = "chat";
+  try {
+    // Go 的 nil slice 在 TS 侧是 null（绑定类型是 MsgLine[] | null），要兜 ?? []
+    const hist = (await Service.SwitchSession(id)) ?? [];
+    lines.value = hist.map((m) =>
+      m.Role === "user"
+        ? ({ kind: "user", text: m.Content } as Line)
+        : ({ kind: "assistant", text: m.Content } as Line),
+    );
+    report.value = "";
+    stick.value = true;
+    await loadSessions();
+    boot.value = await Service.Bootstrap();
+    toBottom();
+  } catch (e) {
+    push("error", fmtErr(e));
+  }
+}
+
+// ---- 三栏拖拽 ----
+function down(e: PointerEvent, which: "left" | "right") {
+  resizing.value = which;
+  const startX = e.clientX;
+  const w0 = which === "left" ? sideW.value : wsW.value;
+  const move = (ev: PointerEvent) => {
+    const d = ev.clientX - startX;
+    if (which === "left") {
+      sideW.value = Math.min(340, Math.max(190, w0 + d));
+    } else {
+      wsW.value = Math.min(480, Math.max(220, w0 - d));
+    }
+  };
+  const up = () => {
+    resizing.value = "";
+    window.removeEventListener("pointermove", move);
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up, { once: true });
+}
+
+const examples = [
+  "分析 com.example.app 的冷启动耗时，并给出优化建议",
+  "检查工程里有没有内存泄漏的风险点",
+  "跑一次构建，报告产物体积与耗时",
+];
+
+function useExample(t: string) {
+  task.value = t;
+  autoGrow();
+  ta.value?.focus();
+}
+</script>
+
+<template>
+  <div class="layout" :class="{ resizing: resizing !== '' }">
+    <!-- 左：功能选择栏 -->
+    <aside class="side" :style="{ width: sideW + 'px' }">
+      <SideBar
+        :sessions="sessions"
+        :toolchain="boot?.Toolchain ?? ''"
+        :running="running"
+        :active="view"
+        @switch="onSwitch"
+        @new-session="newSession"
+        @tools="openView('tools')"
+        @toolchain="openView('toolchain')"
+        @devices="openView('devices')"
+      />
+    </aside>
+    <div class="resizer" @pointerdown="(e) => down(e, 'left')"></div>
+
+    <!-- 中：聊天 / 功能页面（视图路由） -->
+    <main class="center">
+      <div v-if="bootErr" class="booterr">
+        启动失败：{{ bootErr }}（检查 ~/.arkperf/config.json）
+      </div>
+
+      <!-- 空态：金色问候 + 居中输入（学 Reasonix 的落地页） -->
+      <div v-if="view === 'chat' && !hasConversation" class="landing">
+        <div class="greet">ArkPerf，开始今天的分析吧！</div>
+
+        <div class="card landing-card" :class="{ running }">
+          <div v-if="running" class="glowring" aria-hidden="true"><i></i></div>
+          <div v-if="running" class="runstrip">
+            <span class="rdot"></span>
+            <span>运行中 · 已调用 {{ toolCalls }} 次工具</span>
+          </div>
+          <textarea
+            ref="ta"
+            v-model="task"
+            rows="1"
+            placeholder="描述任务…（Enter 发送 · Shift+Enter 换行）"
+            @keydown="onKey"
+            @input="autoGrow"
+          ></textarea>
+          <div class="crow">
+            <span class="hint">Enter 发送 · Shift+Enter 换行</span>
+            <button class="send" :disabled="running || !task.trim()" @click="run" title="发送">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V5" /><path d="M5 12l7-7 7 7" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div v-if="boot" class="model-line">
+          {{ boot.Model }} · {{ boot.ToolCount }} 工具 · {{ boot.MCP }}
+        </div>
+      </div>
+
+      <!-- 会话态：转录 -->
+      <template v-else-if="view === 'chat'">
+        <div class="topstrip">
+          <span class="sess-title" :title="boot?.CWD">{{ curTitle }}</span>
+          <span class="model-tag" v-if="boot">{{ boot.Model }}</span>
+        </div>
+
+        <main ref="streamEl" class="stream" @scroll="onScroll">
+          <div class="column">
+            <template v-for="(l, i) in lines" :key="i">
+              <div v-if="l.kind === 'user'" class="node user">
+                <div class="bubble">{{ l.text }}</div>
+              </div>
+
+              <div v-else-if="l.kind === 'assistant'" class="node assistant">
+                <div class="meta"><span class="adot"></span>方舟智诊</div>
+                <!-- 模型输出是 markdown；v-html 的内容已经过 DOMPurify 消毒 -->
+                <div class="md" v-html="md(l.text)"></div>
+              </div>
+
+              <details v-else-if="l.kind === 'tool'" class="toolrow">
+                <summary>
+                  <span class="tname">{{ l.name }}</span>
+                  <span class="targs">{{ firstLine(l.text) }}</span>
+                </summary>
+                <pre class="tbody">{{ l.text }}</pre>
+              </details>
+
+              <details
+                v-else-if="l.kind === 'result'"
+                class="toolres"
+                :class="{ iserr: l.isErr }"
+                :open="l.text.length <= 240"
+              >
+                <summary>
+                  <span class="mark">{{ l.isErr ? "✗" : "✓" }}</span>
+                  <span class="tname">{{ l.name }}</span>
+                  <span class="targs">{{ firstLine(l.text) }}</span>
+                </summary>
+                <pre class="tbody">{{ l.text }}</pre>
+              </details>
+
+              <div v-else-if="l.kind === 'note'" class="note">{{ l.text }}</div>
+              <div v-else-if="l.kind === 'error'" class="errline">{{ l.text }}</div>
+            </template>
+          </div>
+        </main>
+
+        <section v-if="approval" class="approval">
+          <div class="approval-title">需要批准 · {{ approval.name }}</div>
+          <div class="approval-args">{{ approval.args }}</div>
+          <div class="approval-actions">
+            <button class="primary" @click="answer(true)">允许</button>
+            <button class="ghost" @click="answer(false)">拒绝</button>
+          </div>
+        </section>
+
+        <footer class="composer">
+          <div class="card" :class="{ running }">
+            <div v-if="running" class="glowring" aria-hidden="true"><i></i></div>
+            <div v-if="running" class="runstrip">
+              <span class="rdot"></span>
+              <span>运行中 · 已调用 {{ toolCalls }} 次工具</span>
+              <button class="linkbtn" @click="interrupt">中断</button>
+            </div>
+            <textarea
+              ref="ta"
+              v-model="task"
+              rows="1"
+              placeholder="描述任务…（Enter 发送 · Shift+Enter 换行）"
+              @keydown="onKey"
+              @input="autoGrow"
+            ></textarea>
+            <div class="crow">
+              <span class="hint">Enter 发送 · Shift+Enter 换行</span>
+              <button class="send" :disabled="running || !task.trim()" @click="run" title="发送">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 19V5" /><path d="M5 12l7-7 7 7" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </footer>
+      </template>
+
+      <!-- 功能页：工具清单 -->
+      <div v-else-if="view === 'tools'" class="page">
+        <div class="page-inner">
+          <div class="page-head">
+            <div>
+              <div class="page-title">工具清单</div>
+              <div class="page-sub">{{ filteredTools.length }} / {{ tools.length }} 个已注册工具 · 审批标注与命令行 arkperf tools 一致</div>
+            </div>
+            <input v-model="toolFilter" class="search" placeholder="搜索工具…" />
+          </div>
+          <div class="tool-list">
+            <div v-for="t in filteredTools" :key="t.Name" class="tool-line">
+              <span class="tname">{{ t.Name }}</span>
+              <span class="pill" :class="{ 'pill-accent': t.Approval === '需审批' }">{{ t.Approval }}</span>
+              <span class="tdesc">{{ t.Description }}</span>
+            </div>
+            <div v-if="filteredTools.length === 0" class="empty-sub">没有匹配的工具</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 功能页：工具链探测 -->
+      <div v-else-if="view === 'toolchain'" class="page">
+        <div class="page-inner">
+          <div class="page-head">
+            <div>
+              <div class="page-title">工具链探测</div>
+              <div class="page-sub">hdc / hvigorw / ohpm / node / java 与 DevEco 安装位置</div>
+            </div>
+            <button class="tbtn" :disabled="tcLoading" @click="checkToolchain">
+              {{ tcLoading ? "探测中…" : "重新探测" }}
+            </button>
+          </div>
+          <pre class="page-pre">{{ tcLoading ? "探测中…" : report }}</pre>
+        </div>
+      </div>
+
+      <!-- 功能页：设备列表 -->
+      <div v-else-if="view === 'devices'" class="page">
+        <div class="page-inner">
+          <div class="page-head">
+            <div>
+              <div class="page-title">设备列表</div>
+              <div class="page-sub">通过 hdc list targets 查询，只读操作</div>
+            </div>
+            <button class="tbtn" :disabled="dvLoading" @click="listDevices">
+              {{ dvLoading ? "查询中…" : "刷新" }}
+            </button>
+          </div>
+          <pre class="page-pre">{{ dvLoading ? "查询中…" : report }}</pre>
+        </div>
+      </div>
+    </main>
+
+    <div class="resizer" @pointerdown="(e) => down(e, 'right')"></div>
+
+    <!-- 右：工作区文件 -->
+    <aside class="workspace" :style="{ width: wsW + 'px' }">
+      <WorkspacePanel :cwd="boot?.CWD ?? ''" />
+    </aside>
+  </div>
+</template>
+
+<style scoped>
+.layout {
+  display: flex;
+  height: 100vh;
+  min-width: 0;
+  background: var(--bg);
+}
+.layout.resizing,
+.layout.resizing * {
+  user-select: none !important;
+  cursor: col-resize !important;
+}
+
+/* ---- 左：功能选择栏 ---- */
+.side {
+  flex: none;
+  width: 210px;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border-soft);
+}
+
+/* ---- 分隔条 ---- */
+.resizer {
+  flex: none;
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background-color 0.12s;
+}
+.resizer:hover,
+.resizing .resizer {
+  background: var(--accent-soft);
+}
+
+/* ---- 中 ---- */
+.center {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topstrip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.sess-title {
+  font-size: var(--text-md);
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-tag { font-size: var(--text-xs); color: var(--fg-faint); flex: none; }
+
+.booterr {
+  margin: 10px 16px 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border));
+  border-radius: var(--radius-row);
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, var(--bg-elev));
+}
+
+/* ---- 空态（落地页） ---- */
+.landing {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 26px;
+  padding: 24px;
+}
+.greet {
+  font-size: 30px;
+  font-weight: 700;
+  background: var(--grad-greet);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-align: center;
+  letter-spacing: 0.01em;
+}
+.model-line { font-size: var(--text-xs); color: var(--fg-faint); margin-top: -14px; }
+
+/* ---- 转录 ---- */
+.stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 24px;
+}
+.column {
+  max-width: 800px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.node.user { display: flex; justify-content: flex-end; }
+.bubble {
+  max-width: 78%;
+  padding: 10px 16px;
+  border-radius: var(--radius-bubble);
+  background: var(--bubble-user-bg);
+  border: 1px solid var(--bubble-user-border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.node.assistant .meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  margin-bottom: 4px;
+}
+.adot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+
+/* markdown（v-html 的内容，scoped 下必须 :deep()） */
+.md { color: var(--fg); min-width: 0; }
+.md :deep(p) { margin: 0 0 10px; }
+.md :deep(p:last-child) { margin-bottom: 0; }
+.md :deep(ul), .md :deep(ol) { margin: 0 0 10px; padding-left: 22px; }
+.md :deep(li) { margin-bottom: 2px; }
+.md :deep(h1), .md :deep(h2), .md :deep(h3), .md :deep(h4) { font-weight: 600; margin: 14px 0 8px; }
+.md :deep(h1) { font-size: var(--text-lg); }
+.md :deep(h2) { font-size: var(--text-base); }
+.md :deep(h3) { font-size: var(--text-md); }
+.md :deep(code) {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.md :deep(pre) {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-row);
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0 0 10px;
+}
+.md :deep(pre code) { background: none; border: 0; padding: 0; font-size: var(--text-sm); }
+.md :deep(a) { color: var(--link); }
+.md :deep(blockquote) {
+  margin: 0 0 10px;
+  padding: 2px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--fg-dim);
+}
+.md :deep(table) { border-collapse: collapse; margin: 0 0 10px; font-size: var(--text-sm); }
+.md :deep(th), .md :deep(td) { border: 1px solid var(--border-soft); padding: 4px 10px; text-align: left; }
+.md :deep(th) { color: var(--fg-dim); background: var(--bg-soft); }
+.md :deep(hr) { border: 0; border-top: 1px solid var(--border-soft); margin: 12px 0; }
+
+/* ---- 工具行（可折叠） ---- */
+.toolrow, .toolres {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-row);
+  background: var(--bg-soft);
+  overflow: hidden;
+  min-width: 0;
+}
+.toolrow summary, .toolres summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+  min-width: 0;
+}
+.toolrow summary::-webkit-details-marker,
+.toolres summary::-webkit-details-marker { display: none; }
+.toolrow summary::before, .toolres summary::before {
+  content: "▸";
+  color: var(--fg-faint);
+  transition: transform 0.12s;
+  flex: none;
+}
+details[open] > summary::before { transform: rotate(90deg); }
+.toolrow summary:hover, .toolres summary:hover { background: var(--bg-elev); }
+.tname { color: var(--fg); flex: none; }
+.targs {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tbody {
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.toolres .mark { flex: none; font-weight: 600; }
+.toolres:not(.iserr) .mark { color: var(--ok); }
+.toolres.iserr .mark, .toolres.iserr .tname { color: var(--err); }
+.toolres.iserr { border-color: color-mix(in srgb, var(--err) 35%, var(--border-soft)); }
+
+.note { font-size: var(--text-sm); color: var(--fg-faint); }
+.errline { font-size: var(--text-sm); color: var(--err); }
+
+/* ---- 空态里的示例 ---- */
+.empty { padding: 8px 0 0; text-align: center; }
+.empty-sub { opacity: 0.5; font-size: var(--text-sm); }
+.chips { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+.chip {
+  border: 1px solid var(--border-soft);
+  background: var(--bg-elev);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+  cursor: pointer;
+  transition: border-color 80ms ease, color 80ms ease;
+}
+.chip:hover { border-color: var(--accent); color: var(--fg); }
+
+/* ---- 审批卡 ---- */
+.approval {
+  margin: 0 auto 10px;
+  width: min(800px, calc(100% - 48px));
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-elev));
+  border-radius: var(--radius-card);
+  padding: 12px 14px;
+}
+.approval-title { font-weight: 500; color: var(--warn); }
+.approval-args {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  margin: 8px 0 10px;
+  word-break: break-all;
+  opacity: 0.9;
+}
+.approval-actions { display: flex; gap: 8px; }
+.approval-actions .primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 0;
+  border-radius: var(--radius-row);
+  height: 30px;
+  padding: 0 16px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.approval-actions .ghost {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-row);
+  height: 30px;
+  padding: 0 16px;
+  cursor: pointer;
+}
+
+/* ---- 面板（工具清单 / 报告） ---- */
+.panel, .report {
+  margin: 0 auto 10px;
+  width: min(800px, calc(100% - 48px));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+}
+.x {
+  border: 0;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+.x:hover { color: var(--fg); }
+.panel-body { max-height: 40vh; overflow: auto; padding: 6px 10px; }
+.trow { display: flex; align-items: baseline; gap: 8px; padding: 5px 2px; border-bottom: 1px solid var(--border-soft); }
+.trow:last-child { border-bottom: 0; }
+.tdesc { opacity: 0.72; font-size: var(--text-xs); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.report {
+  margin: 0;
+  padding: 12px 14px 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  max-height: 45vh;
+  overflow-y: auto;
+  position: relative;
+}
+.x-report { position: absolute; right: 10px; top: 8px; }
+
+/* ---- 输入区 ---- */
+.composer { padding: 0 24px 14px; }
+.card {
+  position: relative;
+  max-width: 800px;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-card);
+  transition: border-color 0.12s;
+}
+.card:focus-within { border-color: var(--fg-faint); }
+.card.running { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+
+/* 空态：输入框变紧凑居中（学 Reasonix 落地页的输入卡）。
+   注意 .card.landing-card 是 .landing（flex 列 + align-items:center）的直接子元素，
+   **必须给显式宽度**：flex 会把这类子元素收缩到内容宽，而里面的 textarea
+   又是 width:100%（相对卡片），互相依赖会塌缩成 ~130px（实测踩过）。 */
+.card.landing-card {
+  width: min(480px, 100%);
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  resize: none;
+  color: var(--fg);
+  font: var(--text-base)/1.6 var(--font-ui);
+  padding: 12px 14px 4px;
+  min-height: 44px;
+}
+textarea::placeholder { color: var(--fg-faint); }
+
+.crow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px 10px;
+}
+.hint { font-size: var(--text-xs); color: var(--fg-faint); }
+.send {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 0;
+  background: var(--accent);
+  color: var(--accent-fg);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 80ms ease;
+}
+.send svg { width: 16px; height: 16px; }
+.send:hover:not(:disabled) { background: var(--accent-strong); }
+.send:disabled { opacity: 0.4; cursor: default; }
+
+/* 运行条 + 呼吸点 */
+.runstrip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px 0;
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+}
+.rdot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: rdot-pulse 1.2s ease-in-out infinite;
+  flex: none;
+}
+@keyframes rdot-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+.linkbtn {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--err);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  padding: 2px 6px;
+}
+.linkbtn:hover { text-decoration: underline; }
+
+/* 辉光环（学自 Reasonix 的 composer-glowring：任务运行时沿边框走一圈光） */
+.glowring {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1.5px;
+  pointer-events: none;
+  overflow: hidden;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+.glowring i {
+  position: absolute;
+  width: 150px;
+  height: 150px;
+  background: radial-gradient(
+    circle closest-side,
+    var(--accent) 0%,
+    color-mix(in srgb, var(--accent) 42%, transparent) 38%,
+    transparent 72%
+  );
+  offset-path: border-box;
+  animation: glowtrace 3.4s linear infinite;
+}
+@keyframes glowtrace {
+  to { offset-distance: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .glowring { background: color-mix(in srgb, var(--accent) 55%, transparent); }
+  .glowring i { display: none; animation: none; }
+  .rdot { animation: none; opacity: 0.8; }
+}
+
+/* ---- 右：工作区 ---- */
+.workspace {
+  flex: none;
+  width: 250px;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--sidebar-bg);
+  border-left: 1px solid var(--border-soft);
+}
+
+/* ---- 功能页（工具清单 / 工具链 / 设备） ---- */
+.page {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 28px 32px;
+}
+.page-inner { max-width: 760px; margin: 0 auto; }
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.page-title { font-size: 17px; font-weight: 600; }
+.page-sub { font-size: var(--text-sm); color: var(--fg-faint); margin-top: 4px; }
+.search {
+  width: 240px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-row);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: var(--text-sm);
+  outline: none;
+}
+.search:focus { border-color: var(--fg-faint); }
+.search::placeholder { color: var(--fg-faint); }
+.tool-list { border-top: 1px solid var(--border-soft); }
+.tool-line {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 2px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.tool-line:last-child { border-bottom: 0; }
+.tool-line .tname {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  flex: none;
+  width: 210px;
+}
+.tool-line .pill { flex: none; }
+.tool-line .tdesc { opacity: 0.72; font-size: var(--text-xs); min-width: 0; }
+.page-pre {
+  margin: 0;
+  padding: 14px 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-row);
+}
+.page .tbtn {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-row);
+  background: var(--bg-elev-2);
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  flex: none;
+}
+.page .tbtn:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--fg-faint) 48%, var(--border));
+}
+.page .tbtn:disabled { opacity: 0.5; cursor: default; }
+</style>
