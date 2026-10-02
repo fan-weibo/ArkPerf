@@ -8,8 +8,8 @@
 
 ```bash
 cd ..                      # 回到 desktop/
-wails3 task build          # → bin/arkperf-desktop.exe（原生窗口）
-wails3 task build:server   # → bin/arkperf-desktop-server.exe（浏览器访问 127.0.0.1:9090）
+wails3 task build          # → bin/ArkPerf.exe（原生窗口）
+wails3 task build:server   # → bin/ArkPerf-server.exe（浏览器访问 127.0.0.1:9090）
 ```
 
 `wails3 task build` 会替你做三件单独做不到的事：

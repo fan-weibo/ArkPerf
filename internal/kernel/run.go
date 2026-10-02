@@ -14,6 +14,12 @@ import (
 type Task struct {
 	// Text 是用户的任务描述。
 	Text string
+	// CWD 是这次任务的工作目录：工具里相对路径的基准。
+	//
+	// 留空表示用 Runner.CWD，再留空才回退到进程 CWD。
+	// 按次给而不是只给 Runner：同一个 Runner 可能被前端复用，
+	// 而用户切了工作区之后，下一次任务就该用新的目录。
+	CWD string
 	// Approval 覆盖配置里的审批模式（"ask" | "auto"）。空表示沿用配置。
 	Approval string
 	// MaxTurns 覆盖配置里的轮次上限。0 表示沿用配置。
@@ -24,6 +30,13 @@ type Task struct {
 type Runner struct {
 	Cfg      *Config
 	Registry *Registry
+	// CWD 是默认工作目录（工具相对路径的基准）。
+	//
+	// **要显式设置**：不设的话工具会用进程 CWD，而桌面版双击启动时
+	// 进程 CWD 是 exe 所在目录——界面显示的工作区和工具实际操作的目录
+	// 会错开，表现为"Agent 说文件不存在，可那个文件明明在界面上"
+	// （实测踩过）。Task.CWD 可按次覆盖。
+	CWD string
 	// Approver 为空时，需要审批的工具一律驳回。
 	Approver Approver
 	// Out 是进度与回答的输出目标。
@@ -53,9 +66,17 @@ func (r *Runner) Run(ctx context.Context, t Task) (LoopResult, error) {
 		return LoopResult{}, fmt.Errorf("runner: Registry is required")
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
+	// 工具的工作目录：Task 按次指定 > Runner 默认 > 进程 CWD。
+	//
+	// 这个顺序是刻意的：进程 CWD 在最末，因为它最不可靠——
+	// 图形界面双击启动时它是 exe 所在目录，跟用户以为的工作区毫无关系。
+	cwd := cmp.Or(t.CWD, r.CWD)
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		} else {
+			cwd = "."
+		}
 	}
 
 	events := r.defaultEvents()

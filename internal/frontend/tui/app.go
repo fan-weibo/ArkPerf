@@ -256,12 +256,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.print(styleBold.Render(msg.title) + "\n" + wrapText(msg.body, m.contentWidth()))
 
 	case resetView:
-		m.transcript = nil
-		m.assistantOpen = false
-		m.sel = selection{}
+		m.resetViewState()
 		return m, tea.ClearScreen
 	}
 	return m, nil
+}
+
+// resetViewState 清掉屏幕上的转录（不动模型上下文，也不动持久化会话）。
+//
+// 抽成方法是因为有两个入口：`/clear` 经消息异步走到这里，
+// `/cd` 必须**同步**清——它要在同一帧里把"已切换工作目录"这条说明
+// 放进清空后的屏幕。若改用 tea.Batch 去并发跑清屏与打印，
+// 两者的消息顺序是不保证的（说明有可能被自己清掉）。
+func (m *Model) resetViewState() {
+	m.transcript = nil
+	m.assistantOpen = false
+	m.sel = selection{}
 }
 
 // View 渲染整屏：上面是转录视口，下面是钉在底边的活区。

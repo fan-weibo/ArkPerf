@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
@@ -36,10 +37,14 @@ type BootstrapInfo struct {
 	ToolCount int
 	MCP       string
 	Toolchain string
-	CWD       string
-	Restored  bool
-	Turns     int
-	Updated   string
+	// ToolchainFound / ToolchainTotal 供界面直接判断"工具链齐不齐"（状态点用），
+	// 不必去解析 Toolchain 那句给人读的话。
+	ToolchainFound int
+	ToolchainTotal int
+	CWD            string
+	Restored       bool
+	Turns          int
+	Updated        string
 }
 
 // ToolInfo 是工具清单里的一项。
@@ -126,13 +131,16 @@ func (s *Service) Bootstrap() (BootstrapInfo, error) {
 		return BootstrapInfo{}, err
 	}
 
+	found, total := sess.ToolchainCounts()
 	info := BootstrapInfo{
-		Banner:    sess.Banner(),
-		Model:     sess.ModelName(),
-		ToolCount: sess.Registry().Len(),
-		MCP:       sess.MCPSummary(),
-		Toolchain: sess.ToolchainSummary(),
-		CWD:       sess.CWD(),
+		Banner:         sess.Banner(),
+		Model:          sess.ModelName(),
+		ToolCount:      sess.Registry().Len(),
+		MCP:            sess.MCPSummary(),
+		Toolchain:      sess.ToolchainSummary(),
+		ToolchainFound: found,
+		ToolchainTotal: total,
+		CWD:            sess.CWD(),
 	}
 	if prev := sess.Restored(); prev != nil {
 		info.Restored = true
@@ -369,40 +377,13 @@ type SessionInfo struct {
 	Updated string
 	Turns   int
 	Current bool
-	// SameDir 表示该会话与当前工作目录同处——只有这种允许切换，
-	// 切到别的项目却留着当前 CWD，"看到的历史"和"实际操作的目录"会错开。
-	SameDir bool
-}
-
-// ListSessions 返回会话列表（最近更新在前），当前会话打标。
-// 空会话不上列表：切换过去等于没切换。
-func (s *Service) ListSessions() ([]SessionInfo, error) {
-	sess, err := s.ensureSession()
-	if err != nil {
-		return nil, err
-	}
-	cur := sess.CurrentID()
-	cwd := sess.CWD()
-	all := sess.Sessions()
-	out := make([]SessionInfo, 0, len(all))
-	for _, x := range all {
-		if len(x.Messages) == 0 {
-			continue
-		}
-		out = append(out, SessionInfo{
-			ID:      x.ID,
-			Title:   sessionTitle(x),
-			CWD:     x.CWD,
-			Updated: x.Updated.Format("01-02 15:04"),
-			Turns:   x.Turns(),
-			Current: x.ID == cur,
-			SameDir: sameDirLoose(x.CWD, cwd),
-		})
-	}
-	return out, nil
 }
 
 // SwitchSession 切换到指定会话。
+//
+// **会话属于哪个工作区，就跟到哪个工作区去**：侧栏的树里点一条别的项目的会话，
+// 用户要的是"切过去接着看"，不是"被拒绝"——早先直接报错的版本被用户当场抓到
+// （满屏"该会话属于其他工作目录"）。工作区因此不再是障碍，只是随会话自动切换的上下文。
 //
 // 任务运行中不能切：runner 还抓着旧的 Conversation，中途换会错乱。
 // 返回会话的 user/assistant 消息列表，供前端回放历史转录
@@ -418,9 +399,30 @@ func (s *Service) SwitchSession(id string) ([]MsgLine, error) {
 	if running {
 		return nil, fmt.Errorf("任务运行中，请先中断或等它结束")
 	}
+
+	target, ok := findSession(sess, id)
+	if !ok {
+		return nil, fmt.Errorf("找不到会话：%s", id)
+	}
+	if !sameDirLoose(target.CWD, sess.CWD()) {
+		if err := sess.SetWorkspace(target.CWD); err != nil {
+			return nil, err
+		}
+	}
 	if err := sess.LoadByID(id); err != nil {
 		return nil, err
 	}
+	return transcriptLines(sess), nil
+}
+
+// MsgLine 是回放用的转录行。
+type MsgLine struct {
+	Role    string
+	Content string
+}
+
+// transcriptLines 把会话消息压成可回放的转录行（tool 消息是长输出，跳过）。
+func transcriptLines(sess *app.Session) []MsgLine {
 	msgs := sess.Transcript()
 	out := make([]MsgLine, 0, len(msgs))
 	for _, m := range msgs {
@@ -428,13 +430,161 @@ func (s *Service) SwitchSession(id string) ([]MsgLine, error) {
 			out = append(out, MsgLine{Role: m.Role, Content: m.Content})
 		}
 	}
+	return out
+}
+
+// WorkspaceChoice 是侧栏工作区树里的一项（含它自己的会话）。
+//
+// 树而不是"只列当前工作区"：会话是跨工作区存在的，只列当前那个会让人
+// 切过去之后就"看不到别的项目、也没法切回来"（用户当场指出）。
+// 列表本身不另建一套存储——会话就是工作区的记录，少一份状态就少一处不同步。
+type WorkspaceChoice struct {
+	Path     string
+	Name     string // 显示名：目录最后一段
+	Updated  string // 该工作区下最近一次会话的时间
+	Sessions []SessionInfo
+	Current  bool
+}
+
+// ListWorkspaces 列出**全部工作区及其会话**（当前工作区排第一，其余按最近使用倒序）。
+//
+// 侧栏用它渲染成一棵树：工作区 → 它自己的会话。这样切走之后别的项目仍然看得见，
+// 也点得回去——这正是"只列当前工作区"那版做不到的。
+// 空会话不进树（点进去等于没点），但**当前工作区永远在**，哪怕它还没有任何会话。
+func (s *Service) ListWorkspaces() ([]WorkspaceChoice, error) {
+	sess, err := s.ensureSession()
+	if err != nil {
+		return nil, err
+	}
+
+	cur := sess.CWD()
+	curKey := strings.ToLower(filepath.Clean(cur))
+	curID := sess.CurrentID()
+
+	byKey := map[string]*WorkspaceChoice{}
+	firstSeen := map[string]time.Time{}
+	createdAt := map[string]int64{}     // 会话 ID → 创建时间（仅用于排序，不外露）
+	for _, x := range sess.Sessions() { // 已按更新时间倒序
+		if strings.TrimSpace(x.CWD) == "" || len(x.Messages) == 0 {
+			continue
+		}
+		key := strings.ToLower(filepath.Clean(x.CWD))
+		w, ok := byKey[key]
+		if !ok {
+			w = &WorkspaceChoice{Path: x.CWD, Name: dirName(x.CWD), Sessions: []SessionInfo{}}
+			byKey[key] = w
+			firstSeen[key] = x.Created
+		} else if x.Created.Before(firstSeen[key]) {
+			firstSeen[key] = x.Created // 该工作区最早那条会话的创建时间 = 它"多会儿出现的"
+		}
+		if w.Updated == "" {
+			w.Updated = x.Updated.Format("01-02 15:04") // 该工作区最近一次活动
+		}
+		createdAt[x.ID] = x.Created.UnixNano()
+		w.Sessions = append(w.Sessions, SessionInfo{
+			ID:      x.ID,
+			Title:   sessionTitle(x),
+			CWD:     x.CWD,
+			Updated: x.Updated.Format("01-02 15:04"),
+			Turns:   x.Turns(),
+			Current: x.ID == curID,
+		})
+	}
+
+	// 每个工作区内部的会话按**创建时间倒序**排，且必须稳定。
+	//
+	// 不能按 Updated 排：Updated 会随每次 Save 变化，而"切一下工作区"就会 Save，
+	// 于是同一批会话的时间戳会挤到同一分钟——再遇上不稳定的排序，
+	// 每次刷新出来的次序都不一样（实测被用户当场抓到"一直在乱动"）。
+	// Created 写死不变，用它排出来的次序从会话诞生那天起就不再动。
+	for _, w := range byKey {
+		sort.SliceStable(w.Sessions, func(i, j int) bool {
+			return createdAt[w.Sessions[i].ID] > createdAt[w.Sessions[j].ID]
+		})
+	}
+
+	// 稳定顺序：按"首次出现"升序（老工作区在上，新工作区追加在末尾）。
+	//
+	// **不能把当前工作区提到最前**——那样每切一次整个列表就重排一次，
+	// 用户刚点过的条目会在他眼皮底下换位置（实测被用户当场指出）。
+	// 用 Created 而不是 Updated：Updated 会随使用变化，等于换了个地方继续漂。
+	order := make([]string, 0, len(byKey))
+	for k := range byKey {
+		order = append(order, k)
+	}
+	sort.Slice(order, func(i, j int) bool { return firstSeen[order[i]].Before(firstSeen[order[j]]) })
+
+	out := make([]WorkspaceChoice, 0, len(order)+1)
+	for _, k := range order {
+		w := *byKey[k]
+		w.Current = k == curKey
+		out = append(out, w)
+	}
+	if _, ok := byKey[curKey]; !ok {
+		// 当前工作区还没产生任何会话（刚用"打开文件夹"切过来）：
+		// 追加在末尾而不是插到最前——插到最前会让它在攒出第一条会话时再跳一次位置。
+		out = append(out, WorkspaceChoice{
+			Path: cur, Name: dirName(cur), Current: true, Sessions: []SessionInfo{},
+		})
+	}
 	return out, nil
 }
 
-// MsgLine 是回放用的转录行。
-type MsgLine struct {
-	Role    string
-	Content string
+// findSession 在全部会话里按 id 找一条（切会话时要先知道它属于哪个工作区）。
+func findSession(sess *app.Session, id string) (*kernel.Session, bool) {
+	for _, x := range sess.Sessions() {
+		if x.ID == id {
+			return x, true
+		}
+	}
+	return nil, false
+}
+
+// SwitchWorkspace 切换工作区，并返回该目录下要回放的转录。
+//
+// 两条规则：
+//  1. 当前**已经有对话**：接上目标目录自己的最近一段会话（"接着上次在那个项目里说"）；
+//  2. 当前是**刚开的新会话（空的）**：目标目录也开新会话，**不载入它的旧对话**。
+//     用户点过「新会话」就是"我要一段干净的对话"，此时把他丢进旧会话是最费解的结果
+//     （实测被用户当场指出：新建会话时选工作区，结果跳进了已有会话）。
+//
+// 与 SwitchSession 同一条护栏：任务运行中不能切——runner 还抓着旧的
+// Conversation 与工作目录，中途换会让"这次任务到底在哪操作"变得说不清。
+func (s *Service) SwitchWorkspace(path string) ([]MsgLine, error) {
+	sess, err := s.ensureSession()
+	if err != nil {
+		return nil, err
+	}
+	s.runMu.Lock()
+	running := s.running
+	s.runMu.Unlock()
+	if running {
+		return nil, fmt.Errorf("任务运行中，请先中断或等它结束")
+	}
+
+	// 先判断再切换：SetWorkspace 会把当前会话（可能为空）落盘并载入目标目录的会话
+	fresh := len(sess.Transcript()) == 0
+
+	if err := sess.SetWorkspace(path); err != nil {
+		return nil, err
+	}
+	if fresh {
+		// 让"空"这件事延续到新目录：Reset 会为当前目录新建一条空记录
+		if err := sess.Reset(); err != nil {
+			return nil, err
+		}
+	}
+	return transcriptLines(sess), nil
+}
+
+// dirName 取路径最后一段（Windows 的 \ 与 Unix 的 / 都认）。
+func dirName(p string) string {
+	clean := strings.TrimRight(p, `\/`)
+	i := strings.LastIndexAny(clean, `\/`)
+	if i < 0 {
+		return clean
+	}
+	return clean[i+1:]
 }
 
 // WorkspaceInfo 是右侧工作区面板的数据。

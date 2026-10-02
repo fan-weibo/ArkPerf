@@ -222,6 +222,55 @@ func (s *Session) Transcript() []kernel.Message {
 	return s.conv.Messages()
 }
 
+// SetWorkspace 切换工作目录：换掉 cwd，并接上该目录下的最近一段会话（没有就新建）。
+//
+// 语义与启动时解析工作目录完全一致——切过去应该接着"上次在那个项目里说过的话"，
+// 而不是把原来项目的上下文带过去（那会让模型拿着 A 项目的对话去改 B 项目）。
+//
+// 两件事必须做对：
+//  1. 切走之前先把当前会话落盘，否则这段对话就丢了；
+//  2. 就地 Reset + Restore 复用同一个 Conversation 对象，不换指针——
+//     TUI 这类前端在启动时就持有 Conversation，换指针会让它继续写旧对象。
+func (s *Session) SetWorkspace(dir string) error {
+	abs, err := filepath.Abs(strings.TrimSpace(dir))
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("工作目录不可用：%w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("不是目录：%s", abs)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 已经在这个目录里：什么都不做。否则会把当前会话重置掉，
+	// 用户只是点了一下当前项而已。
+	if strings.EqualFold(filepath.Clean(abs), filepath.Clean(s.cwd)) {
+		return nil
+	}
+
+	s.sess.Messages = s.conv.Messages()
+	if err := s.store.Save(s.sess); err != nil {
+		return fmt.Errorf("切换前保存会话失败：%w", err)
+	}
+
+	s.cwd = abs
+	s.conv.Reset()
+	if prev := s.store.LatestForCWD(abs); prev != nil {
+		s.sess = prev
+		s.restored = prev
+		s.conv.Restore(prev.Messages)
+	} else {
+		s.sess = s.store.New(abs)
+		s.restored = nil
+	}
+	return nil
+}
+
 // LoadByID 切换到指定会话：读盘并恢复转录。
 //
 // 只允许切换**同一工作目录**下的会话：CWD 决定了工具的执行上下文，
@@ -253,6 +302,7 @@ func (s *Session) NewRunner(ap kernel.Approver, ev kernel.LoopEvents) RunFunc {
 	runner := &kernel.Runner{
 		Cfg:          s.cfg,
 		Registry:     s.reg,
+		CWD:          s.cwd, // 工具的工作目录＝当前工作区（不是进程 CWD）
 		Approver:     ap,
 		Events:       &ev,
 		Conversation: s.conv, // 多轮会话的载体
@@ -260,7 +310,8 @@ func (s *Session) NewRunner(ap kernel.Approver, ev kernel.LoopEvents) RunFunc {
 		Out: io.Discard,
 	}
 	return func(ctx context.Context, task string) (kernel.LoopResult, error) {
-		res, err := runner.Run(ctx, kernel.Task{Text: task, MaxTurns: s.maxTurns})
+		// CWD 在每次调用时重新读 s.cwd：用户切了工作区，下一次任务就该用新目录
+		res, err := runner.Run(ctx, kernel.Task{Text: task, MaxTurns: s.maxTurns, CWD: s.cwd})
 		if saveErr := s.Save(); saveErr != nil {
 			fmt.Fprintf(os.Stderr, "arkperf: 会话保存失败: %v\n", saveErr)
 		}
@@ -284,6 +335,12 @@ func (s *Session) ModelName() string { return s.cfg.Provider.Model }
 
 // ToolchainSummary 是工具链摘要。
 func (s *Session) ToolchainSummary() string { return s.tc.Summary() }
+
+// ToolchainCounts 返回工具链的（可用数, 总数），供界面上的状态点使用。
+func (s *Session) ToolchainCounts() (int, int) {
+	found, total, _ := s.tc.Counts()
+	return found, total
+}
 
 // MCPSummary 是 MCP 装配摘要，如 "MCP 5/5 · 13 工具"。
 func (s *Session) MCPSummary() string { return s.mcpBrief }

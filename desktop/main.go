@@ -1,4 +1,4 @@
-// Command arkperf-desktop —— ArkPerf 的桌面 / Web 外壳（Wails 3）。
+// Command ArkPerf —— ArkPerf 的桌面 / Web 外壳（Wails 3）。
 //
 // 这一层只做三件事：建窗口、注册服务、把前端资源交给 Wails。
 // 业务全在 internal/app（前端无关的装配层）与 internal/kernel 里，

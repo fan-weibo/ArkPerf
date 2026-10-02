@@ -389,6 +389,13 @@ func tuiCmd() *cobra.Command {
 				SessionCompacted: sess.Compacted,
 				ResetSession:     sess.Reset,
 				StartupNotice:    notice,
+				// /cd：切工作目录，返回切换后的目录（失败如实抛出，让 TUI 显示原因）
+				SwitchWorkspace: func(path string) (string, error) {
+					if err := sess.SetWorkspace(path); err != nil {
+						return "", err
+					}
+					return sess.CWD(), nil
+				},
 				NewAgent: func(ap kernel.Approver, ev kernel.LoopEvents) tui.RunFunc {
 					return tui.RunFunc(sess.NewRunner(ap, ev))
 				},

@@ -49,6 +49,11 @@ type Options struct {
 	SessionCompacted func() int
 	// ResetSession 开始新会话（/new）：清空上下文并新建持久化记录。
 	ResetSession func() error
+	// SwitchWorkspace 切换工作目录（工作区），返回切换后的目录（/cd）。
+	//
+	// 由调用方注入：TUI 自己不去读配置、不碰 app.Session。
+	// 切换后该目录的最近会话要一并接上——那是装配层的事，TUI 只负责说清楚。
+	SwitchWorkspace func(path string) (string, error)
 	// StartupNotice 在进入界面时先打进转录（例如"已恢复上次会话"）。
 	StartupNotice string
 }

@@ -1,7 +1,9 @@
 version: '3'
 
 vars:
-  APP_NAME: "arkperf-desktop"
+  # 产物名：bin/ArkPerf.exe（桌面版）与 bin/ArkPerf-server.exe（Web 版）。
+  # 用产品名而不是 arkperf-desktop：用户看到的就是这个文件名。
+  APP_NAME: "ArkPerf"
   BIN_DIR: "bin"
   # 固定用 pnpm：这台机器 PATH 里有三套 npm（WorkBuddy 管理的 Node 22、
   # C:\Program Files\nodejs、AppData\Roaming\npm），解析结果随调用方式而变——

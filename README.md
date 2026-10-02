@@ -69,10 +69,15 @@ go run ./cmd/arkperf check        # 工具链：hdc / hvigorw / ohpm / node / ja
 go run ./cmd/arkperf mcp          # 应输出：5/5 服务器已连接 · 13 个工具
 
 # 5) 用起来
-go run ./cmd/arkperf              # TUI（交互式）
+go run ./cmd/arkperf tui          # TUI（交互式；键位与命令见表下）
+go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行（不进屋交互界面）
 go run ./cmd/arkperf tools        # 工具清单（含审批标注）
 go run ./cmd/arkperf devices      # 已连接设备
 ```
+
+> 注意：`arkperf` **不带参数只会打印帮助**，交互式界面要写 `arkperf tui`。
+> 进入 TUI 后按 **`/help`** 可列出全部命令与按键（命令表与补全菜单同源，不会出现"help 里写了但没有"）。
+> 常用：`Enter` 发送 · `Ctrl+J` 换行 · `Esc` 中断 · `PgUp/PgDn` 回看历史 · `/new` 新会话 · `/yes` 切自动批准。
 
 `arkperf mcp` 那一步是分界线：**5/5 才算装好了**。某一个连不上不影响其余几个，
 报错里会给出具体是哪个服务、什么原因（常见原因：python 里没装 `mcp` 包）。
@@ -84,8 +89,8 @@ go run ./cmd/arkperf devices      # 已连接设备
 go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.25
 
 cd desktop
-wails3 task build          # → bin/arkperf-desktop.exe（原生窗口）
-wails3 task build:server   # → bin/arkperf-desktop-server.exe（浏览器访问 127.0.0.1:9090）
+wails3 task build          # → bin/ArkPerf.exe（原生窗口）
+wails3 task build:server   # → bin/ArkPerf-server.exe（浏览器访问 127.0.0.1:9090）
 ```
 
 三栏界面（功能选择栏 / 聊天 / 工作区文件）跟随 Reasonix 的桌面端设计语言；

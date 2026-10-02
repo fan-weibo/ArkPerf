@@ -7,10 +7,11 @@ import {
   Service,
   type BootstrapInfo,
   type ToolInfo,
-  type SessionInfo,
+  type WorkspaceChoice,
 } from "../bindings/github.com/fan-weibo/ArkPerf/desktop";
 import SideBar from "./components/SideBar.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
+import WorkspaceBar from "./components/WorkspaceBar.vue";
 
 // 转录行模型。assistant 的 text 可能是 markdown，渲染时走 md()。
 // tool/result 的 text 分别是"参数串"与"输出全文"：
@@ -44,8 +45,8 @@ const report = ref("");
 const streamEl = ref<HTMLElement | null>(null);
 const ta = ref<HTMLTextAreaElement | null>(null);
 
-// 侧栏数据
-const sessions = ref<SessionInfo[]>([]);
+// 侧栏数据：工作区树（每个工作区带着它自己的会话）
+const workspaces = ref<WorkspaceChoice[]>([]);
 
 // 视图路由：chat = 聊天；tools/toolchain/devices = 侧栏功能各自的页面。
 // 侧栏点功能是"跳转到页面"，不是弹框（用户明确的交互要求）——
@@ -83,6 +84,15 @@ const sideW = ref(210);
 const wsW = ref(240);
 const resizing = ref("");
 
+// 右栏工作区面板的句柄：切了工作区要让它重新列目录（面板自己不监听 prop）
+const wsPanel = ref<InstanceType<typeof WorkspacePanel> | null>(null);
+
+// 点开文件时把右栏放宽——代码在 240px 里没法看。
+// 只在用户还没手动调过宽度（仍是默认窄栏）时才替他放宽：他拖过分隔条就尊重他的选择。
+function onOpenFile() {
+  if (wsW.value <= 260) wsW.value = 460;
+}
+
 const unsubs: (() => void)[] = [];
 // 用户往上翻历史时不许拖拽跟底；滚回底部才恢复跟随
 const stick = ref(true);
@@ -94,8 +104,11 @@ const hasConversation = computed(() =>
 );
 
 const curTitle = computed(() => {
-  const cur = sessions.value.find((s) => s.Current);
-  return cur?.Title ?? "新的会话";
+  for (const w of workspaces.value) {
+    const cur = (w.Sessions ?? []).find((s) => s.Current);
+    if (cur) return cur.Title;
+  }
+  return "新的会话";
 });
 
 function push(kind: Line["kind"], text: string, extra?: Partial<Line>) {
@@ -130,6 +143,14 @@ function fmtErr(e: unknown): string {
 function firstLine(s: string): string {
   const l = s.split("\n", 1)[0] ?? "";
   return l.length > 120 ? l.slice(0, 120) + "…" : l;
+}
+
+// 审批标注在 Go 侧是一整句（如 "按需 · 按需分级: 工作区内免审批，状态根与工作区外需审批"）。
+// 整句塞进 pill 会把行撑爆：pill 是 flex:none 且不换行，描述被挤成 0 宽后
+// 文字溢出到 pill 上，看起来就是"内容重叠"（实测被用户当场指出）。
+// → pill 只放短标签，整句留在悬停提示里。
+function shortApproval(s: string): string {
+  return (s || "").split(" · ")[0] || s;
 }
 
 function autoGrow() {
@@ -178,7 +199,7 @@ onMounted(async () => {
     if (boot.value.Restored) {
       push("note", `已恢复上次会话：${boot.value.Turns} 轮 · ${boot.value.Updated}`);
     }
-    await loadSessions();
+    await loadWorkspaces();
   } catch (e) {
     bootErr.value = fmtErr(e);
   }
@@ -186,12 +207,24 @@ onMounted(async () => {
 
 onUnmounted(() => unsubs.forEach((f) => f()));
 
-async function loadSessions() {
+async function loadWorkspaces() {
   try {
-    sessions.value = (await Service.ListSessions()) ?? [];
+    workspaces.value = (await Service.ListWorkspaces()) ?? [];
   } catch {
-    sessions.value = []; // 侧栏失败不打断主流程
+    workspaces.value = []; // 侧栏失败不打断主流程
   }
+}
+
+// refreshAll 是**所有**"工作区/会话变了"之后必须做的那一组刷新。
+//
+// 抽成一个函数是因为它被几个入口共用（点会话、点工作区、切工作区的下拉、新会话），
+// 而"每个入口各自列一遍"已经漏过一次：点别的工作区里的会话同样会切工作区，
+// 但那条路径当时没刷新右栏文件树——于是界面变成"当前工作区是 fwb、
+// 右侧却还在列 E:\ArkPerf 的文件"（实测被用户当场抓到）。
+async function refreshAll() {
+  await loadWorkspaces();
+  boot.value = await Service.Bootstrap();
+  wsPanel.value?.load();
 }
 
 async function run() {
@@ -276,12 +309,13 @@ async function newSession() {
     lines.value = [];
     report.value = "";
     push("note", "已开始新会话：模型上下文已清空");
-    await loadSessions();
+    await refreshAll();
   } catch (e) {
     push("error", fmtErr(e));
   }
 }
 
+// 切换会话：会连带切换工作区（后端会自动跟随），所以刷新要整块做。
 async function onSwitch(id: string) {
   // 先切视图再等数据：点了会话就该立刻回到聊天页，
   // 历史转录加载完再填充（漏了这行就会"切了会话却还停在功能页"，实测撞过）
@@ -296,8 +330,26 @@ async function onSwitch(id: string) {
     );
     report.value = "";
     stick.value = true;
-    await loadSessions();
-    boot.value = await Service.Bootstrap();
+    await refreshAll();
+    toBottom();
+  } catch (e) {
+    push("error", fmtErr(e));
+  }
+}
+
+// 切换工作区：换目录 → 回放该目录自己的会话 → 整块刷新。
+async function onSwitchWorkspace(path: string) {
+  view.value = "chat";
+  try {
+    const hist = (await Service.SwitchWorkspace(path)) ?? [];
+    lines.value = hist.map((m) =>
+      m.Role === "user"
+        ? ({ kind: "user", text: m.Content } as Line)
+        : ({ kind: "assistant", text: m.Content } as Line),
+    );
+    report.value = "";
+    stick.value = true;
+    await refreshAll();
     toBottom();
   } catch (e) {
     push("error", fmtErr(e));
@@ -343,11 +395,13 @@ function useExample(t: string) {
     <!-- 左：功能选择栏 -->
     <aside class="side" :style="{ width: sideW + 'px' }">
       <SideBar
-        :sessions="sessions"
+        :workspaces="workspaces"
         :toolchain="boot?.Toolchain ?? ''"
+        :tc-found="boot?.ToolchainFound ?? 0"
+        :tc-total="boot?.ToolchainTotal ?? 0"
         :running="running"
         :active="view"
-        @switch="onSwitch"
+        @open-session="onSwitch"
         @new-session="newSession"
         @tools="openView('tools')"
         @toolchain="openView('toolchain')"
@@ -367,6 +421,9 @@ function useExample(t: string) {
         <div class="greet">ArkPerf，开始今天的分析吧！</div>
 
         <div class="card landing-card" :class="{ running }">
+          <div class="cardtop">
+            <WorkspaceBar :current="boot?.CWD ?? ''" :running="running" @switch="onSwitchWorkspace" />
+          </div>
           <div v-if="running" class="glowring" aria-hidden="true"><i></i></div>
           <div v-if="running" class="runstrip">
             <span class="rdot"></span>
@@ -454,6 +511,9 @@ function useExample(t: string) {
 
         <footer class="composer">
           <div class="card" :class="{ running }">
+            <div class="cardtop">
+              <WorkspaceBar :current="boot?.CWD ?? ''" :running="running" @switch="onSwitchWorkspace" />
+            </div>
             <div v-if="running" class="glowring" aria-hidden="true"><i></i></div>
             <div v-if="running" class="runstrip">
               <span class="rdot"></span>
@@ -492,9 +552,16 @@ function useExample(t: string) {
             <input v-model="toolFilter" class="search" placeholder="搜索工具…" />
           </div>
           <div class="tool-list">
-            <div v-for="t in filteredTools" :key="t.Name" class="tool-line">
+            <div
+              v-for="t in filteredTools"
+              :key="t.Name"
+              class="tool-line"
+              :title="t.Description + '\n\n审批：' + t.Approval"
+            >
               <span class="tname">{{ t.Name }}</span>
-              <span class="pill" :class="{ 'pill-accent': t.Approval === '需审批' }">{{ t.Approval }}</span>
+              <span class="pill" :class="{ 'pill-accent': t.Approval === '需审批' }">
+                {{ shortApproval(t.Approval) }}
+              </span>
               <span class="tdesc">{{ t.Description }}</span>
             </div>
             <div v-if="filteredTools.length === 0" class="empty-sub">没有匹配的工具</div>
@@ -539,7 +606,7 @@ function useExample(t: string) {
 
     <!-- 右：工作区文件 -->
     <aside class="workspace" :style="{ width: wsW + 'px' }">
-      <WorkspacePanel :cwd="boot?.CWD ?? ''" />
+      <WorkspacePanel ref="wsPanel" :cwd="boot?.CWD ?? ''" @open-file="onOpenFile" />
     </aside>
   </div>
 </template>
@@ -884,6 +951,15 @@ details[open] > summary::before { transform: rotate(90deg); }
 .card:focus-within { border-color: var(--fg-faint); }
 .card.running { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
 
+/* 输入卡的第一行：工作区选择器（学 Reasonix 把工作区放在 composer 顶部） */
+.cardtop {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px 0;
+  min-width: 0;
+}
+
 /* 空态：输入框变紧凑居中（学 Reasonix 落地页的输入卡）。
    注意 .card.landing-card 是 .landing（flex 列 + align-items:center）的直接子元素，
    **必须给显式宽度**：flex 会把这类子元素收缩到内容宽，而里面的 textarea
@@ -1052,9 +1128,28 @@ textarea::placeholder { color: var(--fg-faint); }
   font-size: var(--text-sm);
   flex: none;
   width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.tool-line .pill { flex: none; }
-.tool-line .tdesc { opacity: 0.72; font-size: var(--text-xs); min-width: 0; }
+/* pill 限宽且不换行：它承载的是短标签，整句在 title 里 */
+.tool-line .pill {
+  flex: none;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 描述吃掉剩余宽度并**允许换行**：工具说明是这一页的主要信息，
+  截成一行反而难读；换行后行高变高，也不会再溢出到 pill 上 */
+.tool-line .tdesc {
+  flex: 1;
+  min-width: 0;
+  opacity: 0.72;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .page-pre {
   margin: 0;
   padding: 14px 16px;

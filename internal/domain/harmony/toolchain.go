@@ -100,9 +100,12 @@ func (tc *Toolchain) Required(name string) Tool {
 	return t
 }
 
-// Summary 生成一行摘要，用于构建提示词与状态展示。
-func (tc *Toolchain) Summary() string {
-	found, missing := 0, make([]string, 0, len(tc.Tools))
+// Counts 返回可用工具数、总数与缺失的工具名。
+//
+// Summary 是"给人读的整句"，但界面上的状态点需要能直接判断"齐不齐"——
+// 让前端去解析那句话里的 "5/5" 太脆（措辞一改就断），所以把数字单独给出。
+func (tc *Toolchain) Counts() (found, total int, missing []string) {
+	total = len(tc.Tools)
 	for _, t := range tc.Tools {
 		if t.Found() {
 			found++
@@ -110,7 +113,13 @@ func (tc *Toolchain) Summary() string {
 		}
 		missing = append(missing, t.Name)
 	}
-	s := strconv.Itoa(found) + "/" + strconv.Itoa(len(tc.Tools)) + " 个工具可用"
+	return found, total, missing
+}
+
+// Summary 生成一行摘要，用于构建提示词与状态展示。
+func (tc *Toolchain) Summary() string {
+	found, total, missing := tc.Counts()
+	s := strconv.Itoa(found) + "/" + strconv.Itoa(total) + " 个工具可用"
 	if len(missing) > 0 {
 		s += "，缺：" + strings.Join(missing, ", ")
 	}

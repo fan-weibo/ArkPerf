@@ -35,6 +35,7 @@ func commands() []SlashCommand {
 		{Name: "yes", Help: "切换自动批准（免确认执行危险工具）", Run: cmdYes},
 		{Name: "status", Help: "显示当前装配状态", Run: cmdStatus},
 		{Name: "new", Help: "开始新会话（清空模型上下文）", Run: cmdNew},
+		{Name: "cd", Help: "切换工作目录（工作区，会换成该目录的会话）", Run: cmdCd},
 		{Name: "clear", Help: "清空屏幕上的转录（不影响上下文）", Run: cmdClear},
 		{Name: "mouse", Help: "切换鼠标捕获：开=滚轮+内置选中，关=交还终端原生划选", Run: cmdMouse},
 		{Name: "exit", Help: "退出 TUI", Run: cmdExit},
@@ -207,6 +208,36 @@ func cmdNew(m *Model, _ string) tea.Cmd {
 func cmdClear(m *Model, _ string) tea.Cmd {
 	// 交给 Update 统一处理：那里既能清内存副本，也能清屏
 	return func() tea.Msg { return resetView{} }
+}
+
+// cmdCd 切换工作目录（工作区）。
+//
+// 换目录＝换项目：模型上下文随之换成那个目录自己的最近会话（装配层负责接上）。
+// **屏幕必须一起清掉**——否则会出现"屏幕上是 A 项目的对话，模型却拿着 B 项目的
+// 历史在干活"这种最危险的错位。这与 /new、/clear 的取舍是同一条原则：
+// 任何时候都别让屏幕显示的东西和模型实际持有的东西不一致。
+func cmdCd(m *Model, arg string) tea.Cmd {
+	dir := strings.TrimSpace(arg)
+	if dir == "" {
+		return m.print(styleDim.Render("用法：/cd <目录>") + "\n" +
+			styleDim.Render("  当前工作目录："+m.opts.CWD))
+	}
+	if m.opts.SwitchWorkspace == nil {
+		return m.print(styleDim.Render("（当前不支持切换工作目录）"))
+	}
+
+	next, err := m.opts.SwitchWorkspace(dir)
+	if err != nil {
+		return m.print(styleErr.Render("✗ 切换失败：" + err.Error()))
+	}
+
+	m.opts.CWD = next // 状态行与 /status 显示的目录要跟着变
+	// 同步清屏（不用 tea.Batch：并发跑"清屏"与"打印说明"的顺序是不保证的，
+	// 说明有可能被自己清掉），再把说明放进清空后的屏幕
+	m.resetViewState()
+	return m.print(styleWarn.Render("已切换工作目录："+next) + "\n" +
+		styleDim.Render("上下文已换成该目录的最近会话（屏幕一并清空，避免与上下文错位）；"+
+			"/status 看会话规模，/new 开始新会话"))
 }
 
 func cmdExit(_ *Model, _ string) tea.Cmd { return tea.Quit }

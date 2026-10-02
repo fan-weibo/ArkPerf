@@ -5,11 +5,11 @@
 	"info": {
 		"0000": {
 			"ProductVersion": "0.1.0",
-			"CompanyName": "My Company",
-			"FileDescription": "A arkperf-desktop application",
-			"LegalCopyright": "© 2026, My Company",
+			"CompanyName": "ArkPerf",
+			"FileDescription": "方舟智诊 · OpenHarmony 应用性能体验分析与优化 Agent",
+			"LegalCopyright": "© 2026 ArkPerf",
 			"ProductName": "ArkPerf",
-			"Comments": "This is a comment"
+			"Comments": "https://github.com/fan-weibo/ArkPerf"
 		}
 	}
 }

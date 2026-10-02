@@ -78,3 +78,10 @@ mcp-servers/legacy/
 # 它与另一个项目逐项对比，属于决策材料而非项目文档；
 # 公开后读者注意力会被引到别的项目上，对评委传达的也不是"自身设计"。
 docs/gap-vs-hmharness.md
+
+# ---- 图标生成的一次性脚本与源素材 ----
+# 只在作者本机跑过一次，脚本里硬编码了本机绝对路径，对别人无用；
+# 中间产物只有这个脚本引用，最终图标（appicon.png / icon.ico / icons.icns）已在仓库里。
+generate_icons.py
+icon-concept-02-a-scan.png
+desktop/build/icons_png/
