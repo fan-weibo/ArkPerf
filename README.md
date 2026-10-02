@@ -70,7 +70,7 @@ go run ./cmd/arkperf mcp          # 应输出：5/5 服务器已连接 · 13 个
 
 # 5) 用起来
 go run ./cmd/arkperf tui          # TUI（交互式；键位与命令见表下）
-go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行（不进屋交互界面）
+go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行（不进入交互界面）
 go run ./cmd/arkperf tools        # 工具清单（含审批标注）
 go run ./cmd/arkperf devices      # 已连接设备
 ```
@@ -107,7 +107,6 @@ internal/domain/harmony/ 鸿蒙工具链探测与工程结构解析
 internal/frontend/tui/  TUI 前端
 desktop/                桌面端外壳（Wails3 + Vue3）
 mcp-servers/            5 个 Python 测量服务（本项目的测量能力来源）
-docs/                   设计文档与对比分析
 ```
 
 ## 换机器 / 换克隆位置
