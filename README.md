@@ -18,7 +18,7 @@
 
 | 依赖 | 用途 | 参考版本 |
 |---|---|---|
-| Go | 构建 CLI 与内核 | **1.26.5+**（`go.mod` 里写的就是它） |
+| Go | 构建内核与命令行入口 | **1.26.5+**（`go.mod` 里写的就是它） |
 | **Python + `mcp` 包** | **跑测量服务（必需）** | 3.13 |
 | DevEco Studio | 提供 `hdc` / `hvigorw` / `ohpm` | 6.1 |
 | Node + pnpm | 仅构建桌面端时需要 | 22 / pnpm 12 |
@@ -74,6 +74,9 @@ go run ./cmd/arkperf mcp          # 应输出：5/5 服务器已连接 · 13 个
 
 # 5) 用起来
 go run ./cmd/arkperf tui          # TUI（交付形态之一；键位与命令见表下）
+#    进去之后发一句话就能跑完整体检，例如：
+#      "对 com.example.perfapp 做一次完整体验体检，归档报告"
+#    四类指标全采完会落一份报告到 <工作区>/reports/（见下面的说明）
 
 # 头两个子命令是开发期验证入口，不是产品形态：一次性跑完就退出、不留会话历史
 go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行
@@ -84,7 +87,7 @@ go run ./cmd/arkperf tools        # 工具清单（含审批标注）
 go run ./cmd/arkperf skills       # 技能清单（三层目录 + 来源路径）
 go run ./cmd/arkperf rules        # 已保存的审批规则
 go run ./cmd/arkperf devices      # 已连接设备
-go test ./...                     # 全量测试（438+129 项）
+go test ./...                     # 全量测试（470 顶层 + 143 子测试）
 ```
 
 > 注意：`arkperf` **不带参数只会打印帮助**，交互式界面要写 `arkperf tui`。
@@ -93,7 +96,13 @@ go test ./...                     # 全量测试（438+129 项）
 >
 > 进入 TUI 后按 **`/help`** 可列出全部命令与按键（命令表与补全菜单同源，不会出现"help 里写了但没有"）。
 > 常用：`Enter` 发送 · `Ctrl+J` 换行 · `Esc` 中断 · `PgUp/PgDn` 回看历史 ·
-> `/new` 新会话 · `/yes` 切自动批准 · `/skills` 技能清单 · `/rules` 审批规则。
+> **`/sessions` 列出并切换本工作区的会话** · `/new` 新会话（清上下文并清屏） ·
+> `/yes` 切自动批准 · `/skills` 技能清单 · `/rules` 审批规则。
+
+顺带说清最难找的东西——**报告落在哪**：体检报告写进
+`<工作区>/reports/report-<时间>-<tag>.md`（同名 `.json`，目录自动创建）。
+tag 用 `baseline` / `optimized` 这类固定词：优化前后各跑一次，两份报告并排躺在同一个
+`reports/` 里，靠 tag 认出哪份是基线。
 
 `arkperf mcp` 那一步是分界线：**5/5 才算装好了**。某一个连不上不影响其余几个，
 报错里会给出具体是哪个服务、什么原因（常见原因：python 里没装 `mcp` 包）。
@@ -126,8 +135,9 @@ internal/frontend/tui/  TUI 前端
 desktop/                桌面端外壳（Wails3 + Vue3）
 mcp-servers/            5 个 Python 测量服务（本项目的测量能力来源）
 skills/                 内置技能：与 mcp-servers/ 平级的随仓库分发数据
-docs/                   设计与现状文档
 ```
+
+（本仓库另有一个不进版本库的 `docs/`，放内部工作记录；克隆下来看不到它。）
 
 ## 技能（skill）
 
