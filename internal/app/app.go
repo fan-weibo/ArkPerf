@@ -65,8 +65,8 @@ func NewRegistry() *kernel.Registry {
 //
 // 内核只认 kernel.Tool 这一个形状，所以"本地工具"和"远端工具"在下游
 // 没有任何区别——审批、截断、结果回填全部走同一条路径。
-func AttachMCP(ctx context.Context, cfg *kernel.Config, reg *kernel.Registry) *mcp.Set {
-	return mcp.LoadAll(ctx, reg, mcp.FromConfig(cfg))
+func AttachMCP(ctx context.Context, cfg *kernel.Config, reg *kernel.Registry, dir string) *mcp.Set {
+	return mcp.LoadAll(ctx, reg, mcp.FromConfig(cfg), dir)
 }
 
 // SkillsFor 按工作目录解析可用技能（项目级 > 用户级 > 内置），并返回发现过程中的问题。
@@ -148,6 +148,82 @@ type Session struct {
 	rules *kernel.ApprovalRules
 }
 
+// resolveWorkspace 决定这次启动用哪个工作目录。
+//
+// 优先级：显式指定 > 配置的 workspace > **进程 CWD**（有信息量时）
+//
+//	> 最近一次会话的目录 > 进程 CWD（兜底）
+//
+// 进程 CWD 为什么要分两种待遇：它在不同启动方式下含义完全不同。
+//   - 终端里 `cd E:\proj && arkperf tui`：CWD 是**用户刚敲下的明确意图**，
+//     理应压过"上次在哪个目录聊过天"。
+//   - 双击 exe：CWD 只是可执行文件所在目录（Windows 的行为），没有信息量；
+//     这时该退回"最近一次会话的目录"，否则双击启动会落进 bin/ 这种地方
+//     （实测踩过：侧栏切会话全被拒、右栏面板报"会话未初始化"）。
+//
+// 这个区别早先没做，于是终端场景被桌面场景的规则劫持：用户
+// `cd E:\.OpenHarmony` 启动 TUI，工作区却停在历史里的 `E:\ArkPerf-Test`
+// （实测被用户当场抓到）。
+//
+// 每个候选都要确认目录真实存在，不存在就继续往后回退。
+func resolveWorkspace(explicit, cfgWorkspace string, store *kernel.SessionStore) string {
+	var recent []string
+	if store != nil {
+		for _, prev := range store.List() {
+			if len(prev.Messages) > 0 {
+				recent = append(recent, prev.CWD)
+			}
+		}
+	}
+	wd, _ := os.Getwd()
+	return pickWorkspace(explicit, cfgWorkspace, recent, wd, exeDir())
+}
+
+// pickWorkspace 是 resolveWorkspace 里真正做决定的纯函数部分。
+// wd / exe / recent 由调用方传入，逻辑因此可以脱离真实进程状态单测。
+func pickWorkspace(explicit, cfgWorkspace string, recent []string, wd, exe string) string {
+	cands := []string{explicit, cfgWorkspace}
+
+	// 进程 CWD 等于 exe 目录 = 双击启动的副作用，没有信息量
+	cwdUsable := strings.TrimSpace(wd) != "" && !samePath(wd, exe)
+	if cwdUsable {
+		cands = append(cands, wd)
+	}
+	cands = append(cands, recent...)
+	if !cwdUsable && strings.TrimSpace(wd) != "" {
+		cands = append(cands, wd) // 兜底：总比 "." 好
+	}
+
+	for _, c := range cands {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return "."
+}
+
+// exeDir 返回可执行文件所在目录；拿不到时返回空串（比较时视为不等）。
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(exe)
+}
+
+// samePath 比较两个路径是否指向同一处（Windows 上大小写不敏感）。
+// 空串一律判不等——"拿不到"不该被当成"相等"。
+func samePath(a, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
 // Open 读配置、装配工具与 MCP、按工作目录接上最近一段会话。
 func Open(ctx context.Context, o Options) (*Session, error) {
 	cfg, err := kernel.Load(kernel.ConfigPath())
@@ -162,33 +238,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	// store 要先建：工作目录的解析要用到会话历史。
 	store := kernel.NewSessionStore(kernel.Home())
 
-	// 工作目录的优先级：显式指定 > 配置的 workspace > 最近一次会话的目录 > 进程 CWD。
-	//
-	// 桌面版尤其需要这条链：双击 exe 启动时进程 CWD 是 **exe 所在目录**，
-	// 不解析的话"最近会话恢复"和"工作区面板"就全对不上号（实测踩过：
-	// 会话都存在项目目录下，双击启动后 CWD 却变成了 exe 所在的 bin 目录，
-	// 于是侧栏切会话全部被拒、右栏面板报"会话未初始化"）。
-	// 每个候选都要确认目录真实存在，不存在就继续往后回退。
-	cands := []string{o.Workspace, cfg.Workspace}
-	for _, prev := range store.List() {
-		if len(prev.Messages) > 0 {
-			cands = append(cands, prev.CWD)
-		}
-	}
-	if wd, err := os.Getwd(); err == nil {
-		cands = append(cands, wd)
-	}
-	cwd := "."
-	for _, c := range cands {
-		c = strings.TrimSpace(c)
-		if c == "" {
-			continue
-		}
-		if info, err := os.Stat(c); err == nil && info.IsDir() {
-			cwd = c
-			break
-		}
-	}
+	cwd := resolveWorkspace(o.Workspace, cfg.Workspace, store)
 
 	s := &Session{
 		cfg:      cfg,
@@ -211,7 +261,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		s.rules = rules
 	}
 	if !o.NoMCP {
-		s.mcpSet = AttachMCP(ctx, cfg, s.reg)
+		s.mcpSet = AttachMCP(ctx, cfg, s.reg, s.cwd)
 		s.mcpBrief = "MCP " + s.mcpSet.Summary()
 	}
 

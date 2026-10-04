@@ -41,7 +41,8 @@ python agent_test.py <包名> --modules cold_start,memory
 python agent_test.py <包名> --ability EntryAbility --out ./reports
 ```
 
-输出：终端结论 + `experience-report-<时间>-<tag>.md` / `.json`。
+输出：终端结论 + `<工作区>/reports/report-<时间>-<tag>.md` / `.json`
+（tag 如 baseline / optimized，供优化前后区分；目录不存在会自动创建）。
 
 单独使用某个指标：
 

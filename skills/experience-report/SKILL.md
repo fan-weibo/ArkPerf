@@ -32,7 +32,7 @@ description: 一次跑完整套体验指标并归档报告，用于优化前后�
    mcp_experience_experience_analysis(bundle_name="<包名>")
 
    # 要归档（推荐：优化前后各跑一次，用 tag 区分）
-   mcp_experience_save_experience_report(bundle_name="<包名>", out_dir=".", tag="baseline")
+   mcp_experience_save_experience_report(bundle_name="<包名>", out_dir="reports", tag="baseline")
    ```
 
    常用参数：`ability_name`（只关心某个 Ability 时指定）、`modules`（只分析指定模块）、
@@ -60,6 +60,10 @@ description: 一次跑完整套体验指标并归档报告，用于优化前后�
 
 `tag` 用 `baseline` / `optimized` 这类固定词，不要用时间戳——时间戳会让
 「哪份是基线」变成要靠猜的事。
+
+报告默认落在**工作区下的 `reports/`**（`out_dir="reports"`，目录会自动创建），
+文件名形如 `report-20261005-051307-baseline.md`。所以两次对比报告会并排躺在
+同一个 `reports/` 里，一眼能看出先后。要归档到别处再显式传绝对路径。
 
 ## 耗时与预期
 

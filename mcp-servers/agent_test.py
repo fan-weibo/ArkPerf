@@ -19,7 +19,7 @@ mcp-servers/ 分三层：
   --modules a,b,c      只跑指定模块（cold_start/memory/cpu/jank）
   --quick              快速模式（减少采样次数，用于联调）
   --scene <名>         场景直达（透传 want.parameters.scene，如 leak/block）
-  --out <目录>         报告输出目录（默认当前目录）
+  --out <目录>         报告输出目录（默认 reports/）
   --tag <名>           报告文件名后缀，如 baseline / optimized
 
 示例：
@@ -36,7 +36,7 @@ from agent_core import MODULES, MODULE_LABELS, run_analysis, save_report
 
 def parse_args(argv):
     opts = {"ability": "", "modules": list(MODULES), "quick": False,
-            "scene": "", "out": ".", "tag": ""}
+            "scene": "", "out": "reports", "tag": ""}
     positional = []
     i = 0
     while i < len(argv):
@@ -117,6 +117,10 @@ def main():
 
     paths = save_report(report, out_dir=opts["out"], tag=opts["tag"])
     print()
+    if not paths.get("ok"):
+        # 退出码非零：脚本化调用（CI / 批处理）时不能"看起来成功了"
+        print(f"❌ 报告落盘失败：{paths.get('error')}")
+        sys.exit(1)
     print(f"报告已保存：\n  {paths['markdown']}\n  {paths['json']}")
 
 

@@ -67,7 +67,7 @@ def experience_analysis(bundle_name: str, ability_name: str = "",
 @mcp.tool()
 def save_experience_report(bundle_name: str, ability_name: str = "",
                            modules: str = "", quick: bool = False,
-                           scene: str = "", out_dir: str = ".",
+                           scene: str = "", out_dir: str = "reports",
                            tag: str = "") -> dict:
     """执行体验分析并把报告落盘为 Markdown + JSON（便于优化前后对比归档）。
 
@@ -77,7 +77,7 @@ def save_experience_report(bundle_name: str, ability_name: str = "",
         modules: 逗号分隔的模块；留空表示全部
         quick: 快速模式
         scene: 场景直达参数（want.parameters.scene），如 PerfLab 的 leak/block
-        out_dir: 输出目录
+        out_dir: 输出目录（默认 reports/，相对当前工作区）
         tag: 文件名后缀，如 baseline / optimized
     """
     mods = [m.strip() for m in modules.split(",") if m.strip()] or None
@@ -87,6 +87,11 @@ def save_experience_report(bundle_name: str, ability_name: str = "",
         return {"ok": False, "error": r["error"], "中文说明": "❌ 分析失败"}
 
     paths = core.save_report(r, out_dir=out_dir, tag=tag)
+    if not paths.get("ok"):
+        # 分析跑完了但报告没落盘：必须说出来。否则用户以为有归档，
+        # 下次做优化前后对比时才发现基线是空的。
+        return {"ok": False, "error": paths.get("error"),
+                "中文说明": "❌ 报告落盘失败（分析结果本身有效，可重跑归档）"}
     return {
         "ok": True,
         "报告Markdown": paths["markdown"],

@@ -1,6 +1,8 @@
 package kernel
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,15 +80,36 @@ func NewSessionStore(home string) *SessionStore { return &SessionStore{home: hom
 func (s *SessionStore) Dir() string { return filepath.Join(s.home, "sessions") }
 
 // New 新建一段会话（尚未落盘）。
+//
+// ID = 秒级时间戳 + **4 字节随机**十六进制。
+//
+// 后缀不能用时间的低位：老实现是 `UnixNano()&0xffff`（只有 16 位），
+// 注释还写着"同一秒内连续新建也不会撞 id"——那句是错的。Windows 时钟精度
+// 是毫秒级的，同一秒内两次创建很容易落在相同的低位上；一旦撞 id，
+// 后一次 Save 会**覆盖**前一段会话，用户静默丢掉整段对话
+// （实测：在测试里 3 次能复现 1 次，生产路径上 `/new` 后紧接着切工作区同样中招）。
+//
+// 随机后缀顺带解决另一个隐患：ID 不该能从创建时间推出来。
 func (s *SessionStore) New(cwd string) *Session {
 	now := time.Now()
-	// 时间戳 + 纳秒低位：同一秒内连续新建也不会撞 id
 	return &Session{
-		ID:      fmt.Sprintf("%s-%04x", now.Format("20060102-150405"), now.UnixNano()&0xffff),
+		ID:      fmt.Sprintf("%s-%s", now.Format("20060102-150405"), randomSuffix()),
 		CWD:     cwd,
 		Created: now,
 		Updated: now,
 	}
+}
+
+// randomSuffix 返回 4 字节随机数的十六进制（8 位）。
+//
+// 取不到随机源时退回纳秒低位——降级之后仍然能用，
+// 但不能假装它足够安全（32 位随机撞的概率约 1/43 亿，16 位则高得多）。
+func randomSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Save 落盘。

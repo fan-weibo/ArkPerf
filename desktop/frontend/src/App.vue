@@ -375,6 +375,11 @@ onMounted(async () => {
     boot.value = await Service.Bootstrap();
     if (boot.value.Restored) {
       push("note", `已恢复上次会话：${boot.value.Turns} 轮 · ${boot.value.Updated}`);
+      // 恢复出来的历史要**立刻上屏**：只提示"已恢复"而屏幕空着，
+      // 用户会以为数据丢了（TUI 端实测被问到过同样的问题）。
+      // 顺序是"提示在上、历史在下"，与 TUI 的启动横幅一致。
+      lines.value = [...lines.value, ...replayLines((await Service.CurrentTranscript()) ?? [])];
+      stick.value = true;
     }
     await loadWorkspaces();
   } catch (e) {

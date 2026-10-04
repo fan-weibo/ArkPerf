@@ -101,7 +101,7 @@ func (s *Set) Close() error {
 // 刻意"部分成功也返回"：测量能力应当是部分可用的——CPU 服务起不来，
 // 不该让内存和卡顿也一起用不了。每个服务器的成败都留在 Results 里
 // 如实上报，由调用方决定怎么展示，而不是在这里吞掉。
-func LoadAll(ctx context.Context, reg *kernel.Registry, specs []ServerSpec) *Set {
+func LoadAll(ctx context.Context, reg *kernel.Registry, specs []ServerSpec, dir string) *Set {
 	set := &Set{Results: make([]Result, len(specs))}
 
 	var (
@@ -116,7 +116,7 @@ func LoadAll(ctx context.Context, reg *kernel.Registry, specs []ServerSpec) *Set
 				Env:     spec.Env,
 				Trusted: spec.Trusted,
 				Timeout: spec.Timeout,
-			})
+			}, dir)
 			if err != nil {
 				set.Results[i] = Result{Name: spec.Name, Err: err}
 				return

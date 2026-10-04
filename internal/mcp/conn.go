@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -77,14 +78,24 @@ type Conn struct {
 
 // Connect 启动子进程并完成 MCP 握手。
 //
+// Connect 拉起一个 MCP 服务器子进程并完成握手。
+//
+// dir 是子进程的工作目录（调用方传当前工作区）。**必须显式设**：
+// 不设的话子进程继承父进程 CWD，而父进程 CWD 与"当前工作区"不是一回事——
+// 桌面端从 exe 目录启动，工作区却是用户选的那个目录，于是工具里的相对路径
+// （典型是报告输出目录）会落到 exe 旁边，而不是用户以为的工程里。
+//
 // 握手失败时会把子进程的 stderr 尾巴拼进错误：Python 服务的启动失败
 // （缺包、路径错、解释器不对）几乎全靠这段输出才能定位。
-func Connect(ctx context.Context, name string, cfg ServerConfig) (*Conn, error) {
+func Connect(ctx context.Context, name string, cfg ServerConfig, dir string) (*Conn, error) {
 	if strings.TrimSpace(cfg.Command) == "" {
 		return nil, fmt.Errorf("mcp %s: command is empty", name)
 	}
 
 	cmd := exec.Command(cfg.Command, cfg.Args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	// 桌面版没有控制台：不设这个，每个 MCP 服务器都会弹出一个终端窗口
 	// （实测启动时连 5 个服务器 → 弹 5 个终端）。详见 execx.HideWindow。
 	execx.HideWindow(cmd)
@@ -274,10 +285,12 @@ func (t *remoteTool) Parameters() json.RawMessage       { return t.schema }
 func (t *remoteTool) Original() string                  { return t.original }
 func (t *remoteTool) NeedsApproval(map[string]any) bool { return !t.trusted }
 
-func (t *remoteTool) Execute(ctx context.Context, args map[string]any, _ kernel.ToolCtx) (kernel.ToolResult, error) {
+func (t *remoteTool) Execute(ctx context.Context, args map[string]any, tctx kernel.ToolCtx) (kernel.ToolResult, error) {
 	// 每次调用单独设超时：测量工具动辄跑几分钟，需要比模型请求宽松得多。
 	callCtx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
+
+	absolutizeOutDir(args, tctx.CWD)
 
 	res, err := t.conn.session.CallTool(callCtx, &sdk.CallToolParams{
 		Name:      t.original,
@@ -287,6 +300,26 @@ func (t *remoteTool) Execute(ctx context.Context, args map[string]any, _ kernel.
 		return kernel.ToolResult{}, fmt.Errorf("mcp %s/%s: %w", t.conn.name, t.original, err)
 	}
 	return kernel.ToolResult{Output: renderResult(res), IsError: res.IsError}, nil
+}
+
+// absolutizeOutDir 把相对的 out_dir 按**当前工作区**补成绝对路径。
+//
+// 为什么不能交给子进程自己解析：MCP 子进程的 CWD 只在启动那一刻定下来
+// （桌面端是 exe 目录，且工作区切换后不会跟着变），相对路径落点因此
+// 既不可预测、也不会随工作区切换而更新。
+//
+// 只在工具确实带了 out_dir 时动手，绝对路径原样不动——
+// 模型明确指定位置时不该被"纠正"。
+func absolutizeOutDir(args map[string]any, cwd string) {
+	raw, ok := args["out_dir"]
+	if !ok || cwd == "" {
+		return
+	}
+	dir, ok := raw.(string)
+	if !ok || strings.TrimSpace(dir) == "" || filepath.IsAbs(dir) {
+		return
+	}
+	args["out_dir"] = filepath.Join(cwd, dir)
 }
 
 // renderResult 把 MCP 返回的内容折成一段文本。

@@ -164,3 +164,22 @@ func TestSessionStoreIDCannotEscape(t *testing.T) {
 		t.Fatalf("id 逃出了会话目录：%s", got)
 	}
 }
+
+// 会话 ID 必须唯一：撞 id 会让后一次 Save 静默覆盖前一段会话，
+// 用户丢掉整段对话却毫无提示。
+//
+// 老实现用纳秒低位当后缀（`UnixNano()&0xffff`，只有 16 位），注释还写着
+// "同一秒内连续新建也不会撞 id"——那句是错的。Windows 时钟精度是毫秒级，
+// 紧密循环里这条测试会以很高的概率挂掉（实测在 app 层 3 次能复现 1 次：
+// 新建的会话被 Open 时那条同秒会话覆盖，切过去时才发现 CWD 不对）。
+func TestSessionStoreIDsAreUnique(t *testing.T) {
+	store := NewSessionStore(t.TempDir())
+	seen := make(map[string]bool, 2000)
+	for i := range 2000 {
+		id := store.New(`E:\proj`).ID
+		if seen[id] {
+			t.Fatalf("第 %d 次新建撞了 id：%s", i, id)
+		}
+		seen[id] = true
+	}
+}

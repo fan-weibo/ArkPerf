@@ -36,6 +36,13 @@ func startFakeServer(t *testing.T) sdk.Transport {
 	boom := func(context.Context, *sdk.CallToolRequest, map[string]any) (*sdk.CallToolResult, any, error) {
 		return nil, nil, errors.New("device offline")
 	}
+	// 探针：把收到的 out_dir 原样回显，用来验证"相对路径按工作区补绝对"这一环
+	// 真的作用到了**发往服务端**的参数上，而不只是函数级单测过了。
+	outdirProbe := func(_ context.Context, _ *sdk.CallToolRequest, args map[string]any) (*sdk.CallToolResult, any, error) {
+		return &sdk.CallToolResult{Content: []sdk.Content{
+			&sdk.TextContent{Text: fmt.Sprintf("out_dir=%v", args["out_dir"])},
+		}}, nil, nil
+	}
 
 	schema := map[string]any{
 		"type":       "object",
@@ -45,6 +52,7 @@ func startFakeServer(t *testing.T) sdk.Transport {
 	sdk.AddTool[map[string]any, any](server, &sdk.Tool{Name: "cpu_usage", Description: "CPU 占用快照", InputSchema: schema}, echo)
 	sdk.AddTool[map[string]any, any](server, &sdk.Tool{Name: "memory-leak-check", Description: "内存泄漏判定"}, explicit)
 	sdk.AddTool[map[string]any, any](server, &sdk.Tool{Name: "boom", Description: "总是失败"}, boom)
+	sdk.AddTool[map[string]any, any](server, &sdk.Tool{Name: "outdir_probe", Description: "回显 out_dir"}, outdirProbe)
 
 	ct, st := sdk.NewInMemoryTransports()
 	session, err := server.Connect(t.Context(), st, nil)
@@ -68,8 +76,8 @@ func attachFake(t *testing.T, name string, trusted bool) (*Conn, *kernel.Registr
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if n != 3 {
-		t.Fatalf("expected 3 tools, registered %d", n)
+	if n != 4 {
+		t.Fatalf("expected 4 tools, registered %d", n)
 	}
 	return conn, reg
 }
@@ -77,7 +85,7 @@ func attachFake(t *testing.T, name string, trusted bool) (*Conn, *kernel.Registr
 func TestRegisterIntoProjectsRemoteTools(t *testing.T) {
 	_, reg := attachFake(t, "fake-harmony", true)
 
-	want := []string{"mcp_fake_harmony_boom", "mcp_fake_harmony_cpu_usage", "mcp_fake_harmony_memory_leak_check"}
+	want := []string{"mcp_fake_harmony_boom", "mcp_fake_harmony_cpu_usage", "mcp_fake_harmony_memory_leak_check", "mcp_fake_harmony_outdir_probe"}
 	if got := reg.Names(); !slices.Equal(got, want) {
 		t.Fatalf("tool names:\n got %v\nwant %v", got, want)
 	}
@@ -165,7 +173,7 @@ func TestApprovalDependsOnTrustedFlag(t *testing.T) {
 
 func TestCloseUnregistersTools(t *testing.T) {
 	conn, reg := attachFake(t, "fake-harmony", true)
-	if reg.Len() != 3 {
+	if reg.Len() != 4 {
 		t.Fatalf("before close: %d tools", reg.Len())
 	}
 
@@ -243,7 +251,7 @@ func TestLoadAllReportsFailuresWithoutAborting(t *testing.T) {
 	set := LoadAll(t.Context(), reg, []ServerSpec{
 		{Name: "broken-a", Command: "definitely-not-a-real-binary-arkperf"},
 		{Name: "broken-b", Command: "definitely-not-a-real-binary-arkperf"},
-	})
+	}, "")
 	t.Cleanup(func() { _ = set.Close() })
 
 	if set.Connected() != 0 {
@@ -266,7 +274,7 @@ func TestLoadAllReportsFailuresWithoutAborting(t *testing.T) {
 }
 
 func TestLoadAllEmptyConfig(t *testing.T) {
-	set := LoadAll(t.Context(), kernel.NewRegistry(), nil)
+	set := LoadAll(t.Context(), kernel.NewRegistry(), nil, "")
 	t.Cleanup(func() { _ = set.Close() })
 
 	if got := set.Summary(); got != "未配置 MCP 服务器" {
@@ -275,7 +283,7 @@ func TestLoadAllEmptyConfig(t *testing.T) {
 }
 
 func TestConnectRejectsEmptyCommand(t *testing.T) {
-	if _, err := Connect(t.Context(), "cpu", ServerConfig{}); err == nil {
+	if _, err := Connect(t.Context(), "cpu", ServerConfig{}, ""); err == nil {
 		t.Fatal("empty command must be rejected before spawning anything")
 	}
 }

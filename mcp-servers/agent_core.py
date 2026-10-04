@@ -571,17 +571,40 @@ def render_markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def save_report(report: dict, out_dir: str = ".", tag: str = "") -> dict:
-    """把报告落盘为 JSON + Markdown，返回文件路径。"""
+def save_report(report: dict, out_dir: str = "reports", tag: str = "") -> dict:
+    """把报告落盘为 JSON + Markdown。
+
+    命名：`report-<时间>-<tag>.json/.md`。
+    tag 是流程标记（baseline / optimized），**不是装饰**：
+    优化前后两次对比要靠它认出哪份是基线，去掉就得靠时间戳猜。
+
+    位置：默认 `reports/`。相对路径由调用方（ArkPerf 的 MCP 代理）
+    按**当前工作区**补成绝对路径后再传进来，所以这里只管建目录、写文件。
+
+    返回 {"ok": True, "json":…, "markdown":…}，或 {"ok": False, "error":…}。
+
+    **落盘失败必须如实返回**，不抛异常也不吞掉：报告是这个工具唯一的产出物，
+    静默失败会让用户拿着"已归档"的错觉去做优化前后对比，结论就建在空气上。
+    （同一类问题在 cold_start_core.save_baseline 上已修过一次。）
+    """
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"experience-report-{stamp}" + (f"-{tag}" if tag else "")
+    base = f"report-{stamp}" + (f"-{tag}" if tag else "")
     json_path = os.path.join(out_dir, base + ".json")
     md_path = os.path.join(out_dir, base + ".md")
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        payload = {k: v for k, v in report.items() if k != "markdown"}
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(report.get("markdown", ""))
+    try:
+        # 目录不存在就建：默认的 reports/ 头一次跑必然不存在，
+        # 让用户为此先手动 mkdir 是没道理的。
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            payload = {k: v for k, v in report.items() if k != "markdown"}
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(report.get("markdown", ""))
+    except OSError as e:
+        # OSError 的文本自带出错路径（"[Errno 13] Permission denied: '…'"），
+        # 足够定位到底是目录不可写还是文件名有问题
+        return {"ok": False, "error": f"报告写入失败：{e}"}
 
-    return {"json": json_path, "markdown": md_path}
+    return {"ok": True, "json": json_path, "markdown": md_path}

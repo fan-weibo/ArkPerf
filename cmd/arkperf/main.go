@@ -80,7 +80,7 @@ func newRootCmd() *cobra.Command {
 			reg := app.NewRegistry()
 			reportToolchain(out)
 			if !flagNoMCP {
-				set := app.AttachMCP(cmd.Context(), cfg, reg)
+				set := app.AttachMCP(cmd.Context(), cfg, reg, workDir())
 				defer set.Close()
 				reportMCP(out, set)
 			}
@@ -135,6 +135,17 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(versionCmd(), initCmd(), configCmd(), toolsCmd(), toolCmd(), skillsCmd(), rulesCmd(), mcpCmd(), checkCmd(), devicesCmd(), tuiCmd())
 	root.Version = version
 	return root
+}
+
+// workDir 返回进程当前目录，作为 MCP 子进程的工作目录。
+//
+// 一次性执行没有显式工作区，进程 CWD 就是它（与工具执行的口径一致）；
+// 拿不到时返回空串，子进程将继承父进程 CWD——不为此报错。
+func workDir() string {
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return ""
 }
 
 // reportToolchain 打印工具链状态。
@@ -517,7 +528,7 @@ func mcpCmd() *cobra.Command {
 			}
 
 			reg := app.NewRegistry()
-			set := app.AttachMCP(cmd.Context(), cfg, reg)
+			set := app.AttachMCP(cmd.Context(), cfg, reg, workDir())
 			defer set.Close()
 
 			for _, name := range slices.Sorted(maps.Keys(cfg.MCPServers)) {
@@ -613,6 +624,19 @@ func tuiCmd() *cobra.Command {
 					prev.Turns(), prev.Updated.Format("01-02 15:04"))
 			}
 
+			// 恢复出来的历史要在启动时回放到屏幕上：否则提示语说"已恢复了"、
+			// 屏幕却空着，看起来像数据丢了。只有真恢复了才填。
+			var initial []tui.ReplayLine
+			if sess.Restored() != nil {
+				lines := sess.TranscriptLines()
+				initial = make([]tui.ReplayLine, 0, len(lines))
+				for _, l := range lines {
+					initial = append(initial, tui.ReplayLine{
+						Role: l.Role, Content: l.Content, Name: l.Name, IsError: l.IsError,
+					})
+				}
+			}
+
 			return tui.Run(cmd.Context(), tui.Options{
 				CWD:              sess.CWD(),
 				ModelName:        sess.ModelName(),
@@ -624,8 +648,39 @@ func tuiCmd() *cobra.Command {
 				SessionTurns:     sess.Turns,
 				SessionRetained:  sess.Retained,
 				SessionCompacted: sess.Compacted,
-				ResetSession:     sess.Reset,
+				ResetSession:     sess.NewSession,
 				StartupNotice:    notice,
+				InitialReplay:    initial,
+				// /sessions：列当前工作区的会话。TUI 不 import app，
+				// 所以在这一层把 app 的行/简报映射成 TUI 自己的类型。
+				Sessions: func() []tui.SessionBrief {
+					briefs := sess.WorkspaceSessions()
+					out := make([]tui.SessionBrief, 0, len(briefs))
+					for _, b := range briefs {
+						out = append(out, tui.SessionBrief{
+							ID: b.ID, Title: b.Title, Turns: b.Turns,
+							Updated: b.Updated, Current: b.Current,
+						})
+					}
+					return out
+				},
+				// /sessions <序号>：切过去并回放历史。
+				// 跨工作区的会话由 app 层连工作区一起切，返回的目录要写回 opts.CWD，
+				// 否则状态行会停在旧目录。
+				OpenSession: func(id string) ([]tui.ReplayLine, string, error) {
+					dir, err := sess.OpenSession(id)
+					if err != nil {
+						return nil, "", err
+					}
+					lines := sess.TranscriptLines()
+					out := make([]tui.ReplayLine, 0, len(lines))
+					for _, l := range lines {
+						out = append(out, tui.ReplayLine{
+							Role: l.Role, Content: l.Content, Name: l.Name, IsError: l.IsError,
+						})
+					}
+					return out, dir, nil
+				},
 				// /skills：用闭包而不是取一次固定值——工作目录会随 /cd 变，
 				// 而项目级技能就挂在 <工作目录>/.arkperf/skills 下
 				SkillReport:  func() string { return app.SkillReport(sess.CWD()) },

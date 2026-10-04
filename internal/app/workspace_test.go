@@ -3,16 +3,14 @@ package app
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/fan-weibo/ArkPerf/internal/kernel"
 )
 
-func samePath(a, b string) bool {
-	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
-}
-
+// samePath 用生产实现（app.go）。测试里原先留了一份同样的拷贝，
+// 两处实现同一条规则迟早会漂移，删掉，只留一份。
+//
 // SetWorkspace 必须做对四件事：
 // 换 cwd、接上目标目录自己的最近会话、切走前把旧会话落盘、坏输入不动状态。
 //

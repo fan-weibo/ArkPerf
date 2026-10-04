@@ -65,6 +65,13 @@ type Model struct {
 	height int
 	st     state
 
+	// pendingReplay 是"等着上屏"的启动历史。
+	//
+	// 不能在 Init 里直接回放：那时窗口尺寸还不知道（m.width 为 0），
+	// 折行会退回 20 列的兜底宽度——实测的表现是"历史全挤在左边一条窄栏里"。
+	// 收到第一个 WindowSizeMsg 之后再渲染，宽度才是真的。
+	pendingReplay []ReplayLine
+
 	turns    int
 	toolUses int
 	lastStop kernel.StopReason
@@ -187,6 +194,8 @@ func NewModel(ctx context.Context, o Options, b *Bridge) *Model {
 		// -1 表示"当前没有正在流的块"。零值是 0，会被误当成"第一块"，
 		// 所以必须显式初始化。
 		streamIdx: -1,
+		// 启动历史推迟到第一个窗口尺寸消息之后再渲染（见该字段的说明）
+		pendingReplay: o.InitialReplay,
 	}
 	if o.NewAgent != nil {
 		m.run = o.NewAgent(b, b.Events())
@@ -197,14 +206,22 @@ func NewModel(ctx context.Context, o Options, b *Bridge) *Model {
 func (m *Model) Init() tea.Cmd {
 	// 启动横幅：第一行是身份（◆ 名字 · 模型 · 工具），常驻在转录的最顶上；
 	// 之后的行是提示。内容由 main.go 组装，这里只负责配色。
+	//
+	// **先横幅、后历史**：横幅是"这是哪次启动"，历史是"上次聊了什么"，
+	// 反过来看会以为横幅是历史的一部分。m.print 是同步写转录的，顺序可控。
 	if m.opts.StartupNotice != "" {
 		parts := strings.SplitN(m.opts.StartupNotice, "\n", 2)
 		out := styleAccent.Bold(true).Render("◆ " + parts[0])
 		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
 			out += "\n" + styleDim.Render(parts[1])
 		}
-		return tea.Batch(m.print(out), m.spinner.Tick)
+		m.print(out)
 	}
+
+	// 恢复出来的历史**不在这里**回放：此时窗口宽度还不知道，
+	// 折行会退回 20 列的兜底值（实测表现是"历史挤在左边一条窄栏"）。
+	// 存起来，等第一个 WindowSizeMsg 到达后再渲染（见 Model.pendingReplay）。
+
 	return m.spinner.Tick
 }
 
@@ -213,6 +230,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeInput()
+		// 启动历史等到这一刻再渲染：折行宽度要用真实窗口宽度
+		// （见 Model.pendingReplay 的说明）
+		if m.pendingReplay != nil {
+			m.appendReplay(m.pendingReplay)
+			m.pendingReplay = nil
+			m.follow = true // 打开就停在最新，历史长时也先看到结尾
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -266,6 +290,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case copiedMsg:
 		return m, m.copyResultCmd(msg)
 
+	case tea.PasteMsg:
+		// 括号粘贴：终端里按 Ctrl+V 时，bubbletea 把整段文本作为**独立消息**
+		// 交上来（Windows Terminal / iTerm 等都走这条），而不是一串按键。
+		// 不转发给输入框就等于"按了没反应"——实测用户第一件事就是问
+		// "没有 Ctrl+V 粘贴吗"。
+		//
+		// 审批卡是模态的：跟按键一样，此时粘贴也只归审批卡，不进输入框。
+		if m.st == stateApproving {
+			return m, nil
+		}
+		m.sel = selection{} // 与其他按键一致：有输入动作就收掉旧选区
+		var pasteCmd tea.Cmd
+		m.input, pasteCmd = m.input.Update(msg)
+		m.refreshSlash()
+		return m, pasteCmd
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
@@ -286,6 +326,68 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.ClearScreen
 	}
 	return m, nil
+}
+
+// replay 清屏并回放一段历史（/sessions 切会话时用）。
+func (m *Model) replay(lines []ReplayLine) {
+	m.resetViewState()
+	m.appendReplay(lines)
+}
+
+// appendReplay 把历史渲染进转录（**不清屏**）。
+//
+// 启动恢复时用它：横幅已经在转录最顶上，清屏会把它一起抹掉。
+//
+// **复用实时渲染的同一套函数与样式**：如果回放自己写一套，
+// "刚切过来的历史"和"刚聊出来的内容"会长得不一样，用户会怀疑自己看错了。
+//
+// 写入一律走 m.print——它是全 TUI 唯一的输出出口，
+// 绕过它直接改 m.transcript 会出现"屏幕上有、内存里没有"这类分叉。
+//
+// 头部（"◆ arkperf"）按「每条 user 之后的第一段回答」推导，与实时一致：
+// 一轮里模型常常"说一段、调工具、再说一段"，每段都挂头部就成了噪声。
+func (m *Model) appendReplay(lines []ReplayLine) {
+	out := make([]string, 0, len(lines))
+	headDone := false
+	for _, l := range lines {
+		switch l.Role {
+		case "user":
+			headDone = false
+			out = append(out, styleAccent.Render("  "+userMarker+" ")+wrapText(l.Content, m.contentWidth()-2))
+
+		case "assistant":
+			if strings.TrimSpace(l.Content) == "" {
+				continue
+			}
+			if headDone {
+				out = append(out, renderAssistant(l.Content, m.contentWidth()))
+			} else {
+				headDone = true
+				out = append(out,
+					styleAccent.Render(agentMarker+" arkperf")+"\n"+renderAssistant(l.Content, m.contentWidth()))
+			}
+
+		case "tool":
+			// 优先按实时路径渲染（解析后 compact），解析不了才退回原文
+			var args map[string]any
+			if err := json.Unmarshal([]byte(l.Content), &args); err == nil {
+				out = append(out, m.toolCallLine(l.Name, args))
+			} else {
+				out = append(out, m.toolCallLineRaw(l.Name, l.Content))
+			}
+
+		case "result":
+			head := styleOK.Render("✓ ")
+			if l.IsError {
+				head = styleErr.Render("✗ ")
+			}
+			prefix := head + l.Name + " "
+			out = append(out, prefix+styleDim.Render(firstLine(l.Content, m.lineBudget(prefix))))
+		}
+	}
+	m.print(out...)
+	// 回放完之后这一轮已经"说完"了：下一段实时回答该重新挂头部
+	m.assistantOpen = false
 }
 
 // resetViewState 清掉屏幕上的转录（不动模型上下文，也不动持久化会话）。
@@ -683,6 +785,20 @@ func (m *Model) finish(e event) (tea.Model, tea.Cmd) {
 func (m *Model) toolCallLine(name string, args map[string]any) string {
 	prefix := styleAccent.Render("→ ") + name + " "
 	return prefix + styleDim.Render(ansi.Truncate(compact(args), m.lineBudget(prefix), "…"))
+}
+
+// toolCallLineRaw 用**原始参数串**渲染调用行（回放用）。
+//
+// 历史里的 arguments 是模型写的原文，可能本来就是非法 JSON。
+// 真实时路径只在解析成功后才画调用行，所以这里优先解析再走 toolCallLine
+// （两条路渲染结果一致）；解析不了才退回原文——回放要如实显示当时发了什么，
+// 而不是因为格式不对就把这一行吞掉。
+func (m *Model) toolCallLineRaw(name, args string) string {
+	if strings.TrimSpace(args) == "" {
+		args = "（无参数）"
+	}
+	prefix := styleAccent.Render("→ ") + name + " "
+	return prefix + styleDim.Render(ansi.Truncate(args, m.lineBudget(prefix), "…"))
 }
 
 // lineBudget 算出一行在给定前缀之后还剩多少显示宽度可用。

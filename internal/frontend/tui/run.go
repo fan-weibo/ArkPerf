@@ -62,6 +62,15 @@ type Options struct {
 	SessionCompacted func() int
 	// ResetSession 开始新会话（/new）：清空上下文并新建持久化记录。
 	ResetSession func() error
+	// Sessions 列出**当前工作区**的会话（/sessions）。
+	//
+	// 与其他注入项同一条理由：TUI 不 import app，也不自己去翻会话目录。
+	Sessions func() []SessionBrief
+	// OpenSession 切到指定会话（/sessions <序号>），返回它的回放行与所属目录。
+	//
+	// 跨工作区的会话要连工作区一起切过去，返回的目录供状态行更新——
+	// 否则屏幕上写着旧目录、模型却在另一个目录里干活。
+	OpenSession func(id string) ([]ReplayLine, string, error)
 	// SwitchWorkspace 切换工作目录（工作区），返回切换后的目录（/cd）。
 	//
 	// 由调用方注入：TUI 自己不去读配置、不碰 app.Session。
@@ -69,6 +78,29 @@ type Options struct {
 	SwitchWorkspace func(path string) (string, error)
 	// StartupNotice 在进入界面时先打进转录（例如"已恢复上次会话"）。
 	StartupNotice string
+	// InitialReplay 是启动时要回放的历史（恢复上次会话时填）。
+	//
+	// 必须填：光有"已恢复上次会话"的提示、屏幕却空着，
+	// 用户会以为数据丢了（实测被当场问到）。顺序是横幅在前、历史在后。
+	InitialReplay []ReplayLine
+}
+
+// SessionBrief 是会话列表里的一项（由调用方从 app 层映射而来）。
+type SessionBrief struct {
+	ID      string
+	Title   string
+	Turns   int
+	Updated string
+	Current bool
+}
+
+// ReplayLine 是回放的一行。Role 决定渲染方式，与实时事件一一对应：
+// user / assistant / tool（Name+参数）/ result（Name+输出，IsError 表示失败）。
+type ReplayLine struct {
+	Role    string
+	Content string
+	Name    string
+	IsError bool
 }
 
 // Run 启动 TUI，阻塞到用户退出。

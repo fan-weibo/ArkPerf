@@ -4,9 +4,12 @@
 
 ## 它做什么
 
-一个 CLI / TUI / 桌面端三形态的 Agent：用自然语言描述任务，它调用 `mcp-servers/` 里的
+一个 **TUI 与桌面端两个形态**的 Agent：用自然语言描述任务，它调用 `mcp-servers/` 里的
 5 个测量服务（冷启动、内存、CPU、卡顿、全量体验）在真机或模拟器上采集数据，
 再把"指标 → 现象 → 原因 → 优化建议"整理成报告。
+
+交付形态只有这两个；`arkperf <任务>` 那种一次性执行是**开发期验证入口**
+（不接续会话、不留历史，见下面「快速开始」的说明），不是第三个产品形态。
 
 性能测量能力全部来自本仓库的 `mcp-servers/`，因此**跑起来需要先把 Python 依赖装好**
 （标准库之外只依赖 `mcp` 一个包）。
@@ -70,19 +73,23 @@ go run ./cmd/arkperf check        # 工具链：hdc / hvigorw / ohpm / node / ja
 go run ./cmd/arkperf mcp          # 应输出：5/5 服务器已连接 · 13 个工具
 
 # 5) 用起来
-go run ./cmd/arkperf tui          # TUI（交互式；键位与命令见表下）
-go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行（不进入交互界面）
+go run ./cmd/arkperf tui          # TUI（交付形态之一；键位与命令见表下）
+
+# 头两个子命令是开发期验证入口，不是产品形态：一次性跑完就退出、不留会话历史
+go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行
+go run ./cmd/arkperf tool grep '{"pattern":"TODO","glob":"*.go"}'   # 直接调单个工具
+
+# 其余是自检/查看类子命令
 go run ./cmd/arkperf tools        # 工具清单（含审批标注）
 go run ./cmd/arkperf skills       # 技能清单（三层目录 + 来源路径）
 go run ./cmd/arkperf rules        # 已保存的审批规则
 go run ./cmd/arkperf devices      # 已连接设备
-go run ./cmd/arkperf tool grep '{"pattern":"TODO","glob":"*.go"}'   # 直接调单个工具
 go test ./...                     # 全量测试（438+129 项）
 ```
 
 > 注意：`arkperf` **不带参数只会打印帮助**，交互式界面要写 `arkperf tui`。
 > 一次性执行**不接续会话历史**：每次都是全新上下文，也不会把这次对话存进侧栏——
-> 要多轮与历史回放，用 TUI 或桌面端。
+> 它定位是"脚本化/回归验证"，要多轮与历史回放请用 TUI 或桌面端。
 >
 > 进入 TUI 后按 **`/help`** 可列出全部命令与按键（命令表与补全菜单同源，不会出现"help 里写了但没有"）。
 > 常用：`Enter` 发送 · `Ctrl+J` 换行 · `Esc` 中断 · `PgUp/PgDn` 回看历史 ·

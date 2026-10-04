@@ -50,9 +50,16 @@ __pycache__/
 .venv/
 venv/
 
-# ---- mcp-servers 的测量产出物：跑一次就生成，不属于源码 ----
-# （按产物名单列，不用 *.json / *.md 整目录忽略——
-#   那会把 mcp-servers/README.md 和将来新增的设计文档一起吞掉）
+# ---- 测量产出物：跑一次就生成，不属于源码 ----
+# 报告默认落在**工作区下的 reports/**，所以根目录与 mcp-servers/ 两处都要挡
+# （工作区可以是仓库根，也可以是 mcp-servers/——9 月那批就是这么来的）。
+# 报告名 2026-10-05 起由 experience-report-* 改为 report-<时间>-<tag>：
+# 旧名字的模式也留着，否则改名之前那批历史报告会变成"未跟踪"被误提交。
+#
+# 用 [0-9] 限定时间戳开头，避免误伤将来可能出现的 report-模板.md 之类。
+reports/
+/report-[0-9]*
+mcp-servers/report-[0-9]*
 mcp-servers/experience-report-*
 mcp-servers/perflab_*.json
 mcp-servers/perflab-optimization-comparison-*.md
@@ -61,9 +68,17 @@ mcp-servers/nyc_discover_baseline.jpeg
 mcp-servers/cold_start_baseline.json
 mcp-servers/legacy/
 
-# ---- 内部定位分析：与另一项目的逐项对比，属于决策材料，不进公开仓库 ----
-# （只点名单文件，docs/ 其余内容——项目现状、技术方案、答辩稿——正常跟踪）
-docs/gap-vs-hmharness.md
+# ---- docs/ 整体不进公开仓库 ----
+# 这里存的是**内部材料**：项目现状、与另一项目的逐项对比、工作排期与缺口清单。
+# 它们对内部有用（知道自己验到什么程度），但不适合对外展示。
+#
+# ⚠️ 代价：将来若要把**技术方案 / 答辩稿**作为交付物放进仓库给评委看，
+# 不能放在 docs/ 下——放进去它就永远不进 GitHub。那种材料换目录
+# （例如仓库根的 submissions/），或者临时把这条规则收窄成具体文件名。
+#
+# 注意：忽略规则只对**未跟踪**文件生效。已经跟踪过的文件（如
+# docs/STATUS-2026-10-05.md）必须先 `git rm --cached` 才会真正离开仓库。
+docs/
 
 # ---- 图标生成的一次性脚本与源素材 ----
 # 只在作者本机跑过一次，脚本里硬编码了本机绝对路径，对别人无用；

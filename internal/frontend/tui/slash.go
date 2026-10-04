@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -36,7 +37,8 @@ func commands() []SlashCommand {
 		{Name: "yes", Help: "切换自动批准（免确认执行危险工具）", Run: cmdYes},
 		{Name: "rules", Help: "查看已保存的审批规则（哪些类别不再询问）", Run: cmdRules},
 		{Name: "status", Help: "显示当前装配状态", Run: cmdStatus},
-		{Name: "new", Help: "开始新会话（清空模型上下文）", Run: cmdNew},
+		{Name: "new", Help: "开始新会话（清空上下文与屏幕）", Run: cmdNew},
+		{Name: "sessions", Help: "列出当前工作区的会话；/sessions <序号> 切过去", Run: cmdSessions},
 		{Name: "cd", Help: "切换工作目录（工作区，会换成该目录的会话）", Run: cmdCd},
 		{Name: "clear", Help: "清空屏幕上的转录（不影响上下文）", Run: cmdClear},
 		{Name: "mouse", Help: "切换鼠标捕获：开=滚轮+内置选中，关=交还终端原生划选", Run: cmdMouse},
@@ -226,8 +228,10 @@ func cmdStatus(m *Model, _ string) tea.Cmd {
 
 // cmdNew 开始新会话：清空模型上下文并新建持久化记录。
 //
-// 与 /clear 的区别必须说清楚：屏幕上的转录不删（那是历史记录），
-// 但模型不再看到它。用户最怕的就是"以为清了、其实还带着"或者反过来。
+// **屏幕一起清掉**。旧版留着上一段对话，理由是"那是历史记录"——
+// 但用户的心智是"我开了个新会话"：屏幕还挂着旧对话就不像新的，
+// 也容易出现"屏幕上写着 A、模型手里是空的"这种错位（与 /cd 同一条原则）。
+// 旧会话并没有丢：每轮任务结束都落过盘，可以用 /sessions 切回去。
 func cmdNew(m *Model, _ string) tea.Cmd {
 	if m.opts.ResetSession == nil {
 		return m.print(styleDim.Render("（当前不支持新建会话）"))
@@ -235,7 +239,65 @@ func cmdNew(m *Model, _ string) tea.Cmd {
 	if err := m.opts.ResetSession(); err != nil {
 		return m.print(styleErr.Render("✗ 新建会话失败：" + err.Error()))
 	}
-	return m.print(styleWarn.Render("已开始新会话：上下文已清空，之前的对话不再传给模型（屏幕上的内容仍保留）"))
+	m.resetViewState()
+	return m.print(styleWarn.Render("已开始新会话：上下文与屏幕都已清空") + "\n" +
+		styleDim.Render("之前的对话仍在磁盘上，用 /sessions 可以切回去"))
+}
+
+// cmdSessions 列出当前工作区的会话；带序号则切过去。
+//
+// 为什么需要它：TUI 是交付形态之一，但在它之前**没有任何办法切回旧会话**——
+// /new 之后那段对话就只能靠桌面端侧栏找回来（实测被用户问到"新旧会话怎么切"）。
+func cmdSessions(m *Model, arg string) tea.Cmd {
+	if m.opts.Sessions == nil {
+		return m.print(styleDim.Render("（当前不支持会话列表）"))
+	}
+
+	list := m.opts.Sessions()
+	arg = strings.TrimSpace(arg)
+
+	if arg == "" {
+		if len(list) == 0 {
+			return m.print(styleDim.Render("当前工作区还没有会话（发第一条消息后就会出现）"))
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s\n", styleBold.Render(fmt.Sprintf("当前工作区的会话（%d）", len(list))))
+		for i, s := range list {
+			mark := "  "
+			if s.Current {
+				mark = styleAccent.Render("▸ ")
+			}
+			fmt.Fprintf(&b, "%s%d. %s  %s\n", mark, i+1, s.Title,
+				styleDim.Render(fmt.Sprintf("(%d 轮 · %s)", s.Turns, s.Updated)))
+		}
+		b.WriteString(styleDim.Render("用法：/sessions <序号> 切过去（会清屏并回放该会话的历史）"))
+		return m.print(strings.TrimRight(b.String(), "\n"))
+	}
+
+	idx, err := strconv.Atoi(arg)
+	if err != nil || idx < 1 || idx > len(list) {
+		return m.print(styleErr.Render(fmt.Sprintf("✗ 序号无效：%s（先输 /sessions 看列表）", arg)))
+	}
+	target := list[idx-1]
+	if target.Current {
+		return m.print(styleDim.Render("已经在这个会话里了"))
+	}
+	if m.opts.OpenSession == nil {
+		return m.print(styleDim.Render("（当前不支持切换会话）"))
+	}
+
+	lines, dir, err := m.opts.OpenSession(target.ID)
+	if err != nil {
+		return m.print(styleErr.Render("✗ 切换会话失败：" + err.Error()))
+	}
+
+	// 工作区可能跟着会话一起切了：状态行必须以返回值更新，
+	// 否则屏幕写着旧目录、模型实际在新目录里干活。
+	m.opts.CWD = dir
+	m.replay(lines)
+	return m.print(styleWarn.Render("已切到会话："+target.Title) + "\n" +
+		styleDim.Render(fmt.Sprintf("工作区 %s · %d 轮 · 屏幕已回放该会话的历史",
+			dir, target.Turns)))
 }
 
 func cmdClear(m *Model, _ string) tea.Cmd {

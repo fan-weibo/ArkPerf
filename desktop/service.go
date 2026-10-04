@@ -438,6 +438,18 @@ type SessionInfo struct {
 	Current bool
 }
 
+// CurrentTranscript 返回当前会话的回放行。
+//
+// 启动时前端要它把"抢救回来的历史"立刻上屏：只提示"已恢复上次会话"、
+// 屏幕却空着，用户会以为数据丢了（TUI 端实测被用户当场问到同样的问题）。
+func (s *Service) CurrentTranscript() ([]MsgLine, error) {
+	sess, err := s.ensureSession()
+	if err != nil {
+		return nil, err
+	}
+	return msgLines(sess.TranscriptLines()), nil
+}
+
 // SwitchSession 切换到指定会话。
 //
 // **会话属于哪个工作区，就跟到哪个工作区去**：侧栏的树里点一条别的项目的会话，
@@ -471,58 +483,29 @@ func (s *Service) SwitchSession(id string) ([]MsgLine, error) {
 	if err := sess.LoadByID(id); err != nil {
 		return nil, err
 	}
-	return transcriptLines(sess), nil
+	return msgLines(sess.TranscriptLines()), nil
 }
 
-// MsgLine 是回放用的转录行。
+// MsgLine 是回放用的转录行（前端绑定的形状）。
 //
-// Name 只对 tool / result 两种角色有意义：
-//   - tool：参数串（来自 assistant 的 tool_calls，消息本身不存参数）
-//   - result：工具名（从 tool_call_id 反查，消息里只有 id）
+// Name / IsErr 只对 tool / result 两种角色有意义：
+//   - tool：Name 是工具名，Content 是参数串
+//   - result：Name 是工具名，IsErr 表示这次调用失败了
 //
-// 「标签挂在哪一段回答上」由前端在渲染时按行序推导（每条 user 之后的第一段），
-// 不由本层传标志位——两条回放路径都要各自维护标志位，曾因此丢过一次。
+// **回放逻辑本身在 app 层**（`Session.TranscriptLines`）——TUI 与桌面端共用一份，
+// 两处各写一遍必然漂移（今天刚在 samePath 上踩过一次）。这里只做形状转换。
 type MsgLine struct {
 	Role    string
 	Content string
 	Name    string
+	IsErr   bool
 }
 
-// transcriptLines 把会话消息压成可回放的转录行。
-//
-// **工具调用也必须回放**。之前只回放 user/assistant，结果"切个会话再回来，
-// 工具调用全没了"——用户看到的是残缺的对话，而且无法理解当时的结论是怎么来的。
-//
-// 顺序与实时观看时一致：assistant 文字 → 工具调用 → 工具结果。
-// 文字必须排在工具行**之前**：前端会把连续的 tool/result 行聚成一个
-// 可折叠块，文字夹在中间就会把同一轮的调用切成两截。
-// 工具名要从前面最近一条带 tool_calls 的 assistant 里反查，
-// 因为 tool 消息里只存了 tool_call_id。
-func transcriptLines(sess *app.Session) []MsgLine {
-	msgs := sess.Transcript()
-	out := make([]MsgLine, 0, len(msgs))
-	names := make(map[string]string, len(msgs)) // tool_call_id → 工具名
-	for _, m := range msgs {
-		switch m.Role {
-		case "user":
-			out = append(out, MsgLine{Role: "user", Content: m.Content})
-		case "assistant":
-			// 纯工具调用的 assistant 没有文字可显示，跳过，
-			// 否则界面上会出现一个只有标签的空节点
-			if strings.TrimSpace(m.Content) != "" {
-				out = append(out, MsgLine{Role: "assistant", Content: m.Content})
-			}
-			for _, c := range m.ToolCalls {
-				names[c.ID] = c.Function.Name
-				out = append(out, MsgLine{Role: "tool", Name: c.Function.Name, Content: c.Function.Arguments})
-			}
-		case "tool":
-			name := m.ToolCallID
-			if n := names[m.ToolCallID]; n != "" {
-				name = n
-			}
-			out = append(out, MsgLine{Role: "result", Name: name, Content: m.Content})
-		}
+// msgLines 把 app 层的回放行转成前端绑定的形状。
+func msgLines(lines []app.TranscriptLine) []MsgLine {
+	out := make([]MsgLine, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, MsgLine{Role: l.Role, Content: l.Content, Name: l.Name, IsErr: l.IsError})
 	}
 	return out
 }
@@ -668,7 +651,7 @@ func (s *Service) SwitchWorkspace(path string) ([]MsgLine, error) {
 			return nil, err
 		}
 	}
-	return transcriptLines(sess), nil
+	return msgLines(sess.TranscriptLines()), nil
 }
 
 // dirName 取路径最后一段（Windows 的 \ 与 Unix 的 / 都认）。
