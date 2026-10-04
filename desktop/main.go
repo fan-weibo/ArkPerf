@@ -26,11 +26,14 @@ var assets embed.FS
 // 注册事件载荷类型，供绑定生成器产出**带类型**的前端事件 API。
 // 不注册的话前端只能拿到 any，那几个 payload 的结构就白定义了。
 func init() {
+	application.RegisterEvent[DeltaInfo](evDelta)
 	application.RegisterEvent[string](evAssistant)
 	application.RegisterEvent[ToolCallInfo](evToolCall)
 	application.RegisterEvent[ToolResultInfo](evToolResult)
 	application.RegisterEvent[ApprovalInfo](evApprovalRequest)
+	application.RegisterEvent[ApprovalRuleInfo](evApprovalRule)
 	application.RegisterEvent[ApprovalResolved](evApprovalResolved)
+	application.RegisterEvent[[]WorkspaceChoice](evWorkspaces)
 	application.RegisterEvent[DoneInfo](evDone)
 }
 

@@ -1,4 +1,11 @@
-"""冷启动测量 CLI。
+"""冷启动测量 —— 开发阶段测试程序（第一层）。
+
+mcp-servers/ 分三层：*_core.py 公共后端逻辑 / *_server.py 给 agent 调的
+MCP 薄封装（第三层，产品入口）/ *_test.py 开发阶段测试程序（本文件）。
+
+**本文件不是产品交付路径**：给 agent 用的入口是 cold_start_server.py。
+它用来在开发时手工跑一遍、直接看终端输出，绕过 MCP 协议，改完 core 后最快验证。
+基线存取现在也在 cold_start_core.py 里（load_baseline / save_baseline）。
 
 用法：
   python cold_start_test.py                                    # 测量(默认包名/10次)，保存到默认基线

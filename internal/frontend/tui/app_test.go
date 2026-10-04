@@ -266,18 +266,18 @@ func TestTaskErrorIsShown(t *testing.T) {
 
 func TestApprovalCardAcceptsAndRejects(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		key     rune
-		granted bool
+		name     string
+		key      rune
+		decision kernel.ApprovalDecision
 	}{
-		{"按 y 批准", 'y', true},
-		{"按 Enter 批准", tea.KeyEnter, true},
-		{"按 n 拒绝", 'n', false},
-		{"按 Esc 拒绝", tea.KeyEscape, false},
+		{"按 y 批准一次", 'y', kernel.ApprovalOnce},
+		{"按 Enter 批准一次", tea.KeyEnter, kernel.ApprovalOnce},
+		{"按 n 拒绝", 'n', kernel.ApprovalDeny},
+		{"按 Esc 拒绝", tea.KeyEscape, kernel.ApprovalDeny},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, false)
-			reply := make(chan bool, 1)
+			reply := make(chan kernel.ApprovalDecision, 1)
 
 			h.m.Update(event{kind: evApproval, name: "harmony_build", args: map[string]any{"task": "assembleHap"}, reply: reply})
 
@@ -295,8 +295,8 @@ func TestApprovalCardAcceptsAndRejects(t *testing.T) {
 
 			select {
 			case got := <-reply:
-				if got != tc.granted {
-					t.Fatalf("审批结果 %v，期望 %v", got, tc.granted)
+				if got != tc.decision {
+					t.Fatalf("审批结果 %v，期望 %v", got, tc.decision)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("审批结果没有回传给后台线程")
@@ -312,9 +312,13 @@ func TestApprovalCardAcceptsAndRejects(t *testing.T) {
 }
 
 // 审批期间其他按键必须被忽略：随手敲字不能变成"放行"。
+//
+// 小写 a 也在被忽略之列——"总是允许"只认大写 A（Shift+a）。
+// 理由：审批卡是模态的，而随手敲的一句话里出现小写 a 太常见，
+// 把它绑成持久规则等于让一次手滑永久放行一类调用。
 func TestApprovalIgnoresUnrelatedKeys(t *testing.T) {
 	h := newHarness(t, false)
-	reply := make(chan bool, 1)
+	reply := make(chan kernel.ApprovalDecision, 1)
 	h.m.Update(event{kind: evApproval, name: "harmony_shell", reply: reply})
 
 	h.key('a')
@@ -346,14 +350,14 @@ func TestBridgeAskWaitsForReply(t *testing.T) {
 	b := NewBridge(false)
 	b.SetEmit(c.emit)
 
-	done := make(chan bool, 1)
+	done := make(chan kernel.ApprovalDecision, 1)
 	go func() {
-		granted, err := b.Ask(context.Background(), "harmony_build", nil)
+		decision, err := b.Ask(context.Background(), "harmony_build", nil, "")
 		if err != nil {
-			done <- false
+			done <- kernel.ApprovalDeny
 			return
 		}
-		done <- granted
+		done <- decision
 	}()
 
 	var ev event
@@ -377,10 +381,10 @@ func TestBridgeAskWaitsForReply(t *testing.T) {
 		t.Fatalf("审批事件内容不对：%+v", ev)
 	}
 
-	ev.reply <- true
+	ev.reply <- kernel.ApprovalOnce
 	select {
-	case granted := <-done:
-		if !granted {
+	case decision := <-done:
+		if !decision.Granted() {
 			t.Fatal("应返回放行")
 		}
 	case <-time.After(time.Second):
@@ -393,9 +397,9 @@ func TestBridgeAutoApproveSkipsUI(t *testing.T) {
 	b := NewBridge(true)
 	b.SetEmit(c.emit)
 
-	granted, err := b.Ask(context.Background(), "harmony_build", nil)
-	if err != nil || !granted {
-		t.Fatalf("自动批准应直接放行：granted=%v err=%v", granted, err)
+	decision, err := b.Ask(context.Background(), "harmony_build", nil, "")
+	if err != nil || !decision.Granted() {
+		t.Fatalf("自动批准应直接放行：decision=%v err=%v", decision, err)
 	}
 	if len(c.take()) != 0 {
 		t.Fatal("自动批准不该产生界面事件")
@@ -411,7 +415,7 @@ func TestBridgeAskReturnsWhenClosed(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := b.Ask(context.Background(), "harmony_build", nil)
+		_, err := b.Ask(context.Background(), "harmony_build", nil, "")
 		done <- err
 	}()
 
@@ -717,14 +721,14 @@ func TestViewLinesFitWithinTerminalWidth(t *testing.T) {
 			check("活区", h.m.View().Content)
 
 			// 审批卡是唯一带边框的模态区域，最容易算错宽度
-			reply := make(chan bool, 1)
+			reply := make(chan kernel.ApprovalDecision, 1)
 			h.m.Update(event{kind: evApproval, name: "harmony_install",
 				args: map[string]any{"hap": `E:\proj\entry\build\default\outputs\default\entry-default-unsigned.hap`}, reply: reply})
 			check("审批态", h.m.View().Content)
 
 			// 转录行也一样：它们是打进终端滚动区的，超宽同样会折行
 			check("转录", h.allTranscript())
-			reply <- false
+			reply <- kernel.ApprovalDeny
 		})
 	}
 }
@@ -1301,9 +1305,9 @@ func TestRenderFrameSnapshot(t *testing.T) {
 		"\n--- 整屏（View 每帧重绘，alt-screen）---\n" + h.m.View().Content)
 
 	// 审批卡也要看一眼：它是唯一带边框的模态区域
-	reply := make(chan bool, 1)
+	reply := make(chan kernel.ApprovalDecision, 1)
 	h.m.Update(event{kind: evApproval, name: "harmony_install",
 		args: map[string]any{"hap": `E:\proj\entry\build\default\outputs\default\entry.hap`}, reply: reply})
 	t.Log("\n--- 审批态 ---\n" + h.m.View().Content)
-	reply <- false
+	reply <- kernel.ApprovalDeny
 }

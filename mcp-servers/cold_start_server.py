@@ -4,9 +4,6 @@
 启动：python cold_start_server.py
 """
 
-import json
-import os
-
 try:                                    # 兼容 fastmcp / 官方 SDK v1 / v2
     from fastmcp import FastMCP
 except ImportError:
@@ -18,20 +15,6 @@ except ImportError:
 import cold_start_core as core
 
 mcp = FastMCP("harmony-cold-start")
-
-DEFAULT_BASELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "cold_start_baseline.json")
-
-
-def _load(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _dump(obj, path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
 
 @mcp.tool()
 def cold_start_measure(bundle_name: str, ability_name: str = "",
@@ -57,8 +40,10 @@ def cold_start_measure(bundle_name: str, ability_name: str = "",
     if "error" in r:
         return {"ok": False, "error": r["error"], "中文说明": "❌ 采集失败"}
 
-    path = baseline_path or DEFAULT_BASELINE
-    _dump(r, path)
+    # 落盘交给 core（持久化不是这一层的事）
+    save = core.save_baseline(r, baseline_path)
+    if not save.get("ok"):
+        return {"ok": False, "error": save.get("error"), "中文说明": "❌ 基线保存失败"}
     med = r["stats"]["median"]
     return {
         "ok": True,
@@ -68,7 +53,7 @@ def cold_start_measure(bundle_name: str, ability_name: str = "",
         "有效样本": r["stats"].get("n"),
         "非冷启动剔除": r.get("non_cold_count", 0),
         "中文判定": core.judge_cold_start(int(med)),
-        "基线已保存": path,
+        "基线已保存": save.get("path"),
         "raw": r,
     }
 
@@ -83,11 +68,12 @@ def cold_start_compare(bundle_name: str, ability_name: str = "",
     """
     if not ability_name:
         ability_name = "EntryAbility"
-    path = baseline_path or DEFAULT_BASELINE
-    if not os.path.exists(path):
-        return {"ok": False, "中文说明": "❌ 未找到基线，请先运行 cold_start_measure"}
 
-    baseline = _load(path)
+    baseline = core.load_baseline(baseline_path)
+    if "error" in baseline:
+        return {"ok": False, "error": baseline["error"],
+                "中文说明": "❌ 未找到基线，请先运行 cold_start_measure"}
+
     use_anchor = None
     if anchor and bundle_name != core.ANCHOR_BUNDLE:
         use_anchor = (core.ANCHOR_BUNDLE, core.ANCHOR_ABILITY)

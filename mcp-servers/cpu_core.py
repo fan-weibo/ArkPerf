@@ -1,3 +1,17 @@
+"""CPU 占用测量 —— 公共后端逻辑（第二层）。
+
+mcp-servers/ 分三层：
+  *_core.py    公共后端逻辑（本文件）
+  *_server.py  给 agent 调的 MCP 薄封装（第三层，产品入口）
+  *_test.py    开发阶段测试程序
+
+本层只做「采集 + 统计 + 判定」，不关心谁来调、结果怎么展示，
+保持纯逻辑 + 返回 dict 的接口契约。
+
+启动应用（ensure_running 这类"把环境弄好"的动作）属于测试/入口侧的事，
+不在本层——这一层假定目标进程已经存在。
+"""
+
 import subprocess
 import time
 import re

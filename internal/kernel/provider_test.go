@@ -193,6 +193,56 @@ func TestChatEmptyChoicesIsAnError(t *testing.T) {
 	}
 }
 
+// 工具 schema 是原样嵌进请求的，坏一个就**整个请求**发不出去。
+// 这里守两件事：必须失败，且**点名是哪个工具**——
+// 编码器自己的报错（"invalid character ... after object key value pair"）
+// 看不出是谁的 schema 坏了，用户拿到的会是一句无法行动的天书。
+func TestChatNamesToolWithInvalidSchema(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("坏 schema 不该把请求发出去")
+		jsonReply(200, okBody("ok"))(w, nil)
+	})
+
+	_, err := testClient(srv.URL).Chat(t.Context(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Tools: []ToolSpec{{
+			Name:        "grep",
+			Description: "搜索",
+			Parameters:  json.RawMessage(`{"type":"object", "properties": {"a": {"type":"string"}} "required":["a"]}`), // 缺逗号
+		}},
+	})
+	if err == nil {
+		t.Fatal("坏 schema 应当报错")
+	}
+	if !strings.Contains(err.Error(), "grep") {
+		t.Fatalf("报错必须点名工具，实际：%v", err)
+	}
+	if strings.Contains(err.Error(), "invalid character") {
+		t.Fatalf("不该把编码器的天书原样透传：%v", err)
+	}
+	// 好的 schema 不能被误伤：合法 JSON 照常发出去
+	var body map[string]any
+	srv2 := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		jsonReply(200, okBody("ok"))(w, r)
+	})
+	if _, err := testClient(srv2.URL).Chat(t.Context(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Tools: []ToolSpec{{
+			Name:        "read_file",
+			Description: "读取",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`),
+		}},
+	}); err != nil {
+		t.Fatalf("合法 schema 不该被拦：%v", err)
+	}
+	if _, ok := body["tools"]; !ok {
+		t.Fatalf("tools 应当被发送：%#v", body["tools"])
+	}
+}
+
 func TestChatRespectsContextCancellation(t *testing.T) {
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()

@@ -15,24 +15,32 @@ import (
 type eventKind int
 
 const (
-	evAssistant  eventKind = iota // 模型的文字输出
-	evToolCall                    // 开始调用工具
-	evToolResult                  // 工具返回
-	evApproval                    // 需要用户批准（后台线程会阻塞等回答）
-	evDone                        // 任务结束
+	evDelta        eventKind = iota // 流式增量（模型边产边发）
+	evAssistant                     // 一轮的文字输出定稿（完整文本）
+	evToolCall                      // 开始调用工具
+	evToolResult                    // 工具返回
+	evApproval                      // 需要用户批准（后台线程会阻塞等回答）
+	evApprovalRule                  // 审批规则的说明（按规则放行 / 规则已记住 / 没记住）
+	evDone                          // 任务结束
 )
 
 // event 是后台任务线程推给 TUI 的消息，直接当 tea.Msg 用。
 type event struct {
-	kind   eventKind
-	text   string
-	name   string
-	args   map[string]any
-	isErr  bool
+	kind  eventKind
+	text  string
+	name  string
+	args  map[string]any
+	isErr bool
+	// delta 只用于 evDelta：区分可见回答与思考过程。
+	delta kernel.DeltaKind
+	// scope 只用于 evApproval：这次调用的"类别"，空表示不可记忆。
+	scope string
+	// rule 只用于 evApprovalRule。
+	rule   kernel.ApprovalRuleNote
 	result kernel.LoopResult
 	err    error
 	// reply 只用于审批：TUI 把用户决定写回，后台线程阻塞等它。
-	reply chan bool
+	reply chan kernel.ApprovalDecision
 }
 
 // notice 是前端自身的提示行（不来自内核）。
@@ -103,8 +111,15 @@ func (b *Bridge) Interrupt() {
 }
 
 // Events 返回内核需要的回调集合。
+//
+// OnDelta 一并挂上：内核看到它就要求模型走流式，于是模型是边产边发的。
+// 这不会破坏只看 OnAssistant 的实现——那一路拿到的是完整文本，
+// 仍然是每轮一次。
 func (b *Bridge) Events() kernel.LoopEvents {
 	return kernel.LoopEvents{
+		OnDelta: func(kind kernel.DeltaKind, text string) {
+			b.Send(event{kind: evDelta, delta: kind, text: text})
+		},
 		OnAssistant: func(text string) {
 			b.Send(event{kind: evAssistant, text: text})
 		},
@@ -114,30 +129,33 @@ func (b *Bridge) Events() kernel.LoopEvents {
 		OnToolResult: func(name, output string, isErr bool) {
 			b.Send(event{kind: evToolResult, name: name, text: output, isErr: isErr})
 		},
+		OnApprovalRule: func(note kernel.ApprovalRuleNote) {
+			b.Send(event{kind: evApprovalRule, rule: note})
+		},
 	}
 }
 
 // Ask 实现 kernel.Approver。
 //
-// 后台线程在这里阻塞，直到用户按下 y/n（或任务被取消、界面退出）。
+// 后台线程在这里阻塞，直到用户按下 y/a/n（或任务被取消、界面退出）。
 // 三路 select 缺一不可：少了 ctx 分支，中断后线程会永远挂着；
 // 少了 closed 分支，退出后同样挂死。
-func (b *Bridge) Ask(ctx context.Context, name string, args map[string]any) (bool, error) {
+func (b *Bridge) Ask(ctx context.Context, name string, args map[string]any, scope string) (kernel.ApprovalDecision, error) {
 	if b.auto.Load() {
-		return true, nil
+		return kernel.ApprovalOnce, nil
 	}
-	reply := make(chan bool, 1)
-	if !b.Send(event{kind: evApproval, name: name, args: args, reply: reply}) {
-		return false, errors.New("界面已关闭")
+	reply := make(chan kernel.ApprovalDecision, 1)
+	if !b.Send(event{kind: evApproval, name: name, args: args, scope: scope, reply: reply}) {
+		return kernel.ApprovalDeny, errors.New("界面已关闭")
 	}
 
 	select {
-	case granted := <-reply:
-		return granted, nil
+	case decision := <-reply:
+		return decision, nil
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return kernel.ApprovalDeny, ctx.Err()
 	case <-b.closed:
-		return false, errors.New("界面已关闭")
+		return kernel.ApprovalDeny, errors.New("界面已关闭")
 	}
 }
 

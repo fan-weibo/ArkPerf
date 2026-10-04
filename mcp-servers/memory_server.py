@@ -83,6 +83,15 @@ def memory_trend(bundle_name: str, duration: int = 10,
                  interval: float = 1.0, workload: bool = True) -> dict:
     """采样应用内存变化趋势，返回 PSS / ArkTS 堆 / Native 堆序列。
 
+    **本工具不触发 GC**，这一点必须写清楚，否则极易被误读：
+    堆在两次 GC 之间上涨是垃圾回收器的正常工作方式（垃圾先堆着、攒够了一起收），
+    所以这条曲线单调上升**只说明"产生了垃圾还没回收"，不是泄漏证据**。
+    判定是否泄漏要用 memory_leak_check：它每个周期强制 GC，看的是
+    GC 之后的「回落点」是否逐次抬升。
+
+    典型误读：看到本工具 3822→4170 就报"内存持续上涨，疑似泄漏"。
+    正确的读法是拿它做过程观察，结论由 memory_leak_check 给。
+
     Args:
         bundle_name: 应用包名
         duration: 采样总时长（秒）
@@ -99,6 +108,11 @@ def memory_trend(bundle_name: str, duration: int = 10,
         "ArkTS序列_kB": r.get("ark_ts_samples_kb"),
         "Native序列_kB": r.get("native_samples_kb"),
         "有效样本": r.get("valid_samples"),
+        # 防误读：结论随数据一起返回，而不是只写在文档里——
+        # 模型（和人）看的是返回值，不是源码注释。
+        "是否触发GC": False,
+        "怎么读这条曲线": "本序列未触发 GC，单调上升属正常（垃圾尚未回收），"
+                          "不能据此判泄漏；是否泄漏请用 memory_leak_check 看回落点是否逐次抬升",
         "raw": r,
     }
 

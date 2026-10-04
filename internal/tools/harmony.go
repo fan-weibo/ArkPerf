@@ -24,7 +24,7 @@ import (
 // build 之所以也要审批：hvigor 会执行工程自带的 hvigorfile.ts，
 // 那等同于运行工程提供的代码。分析第三方工程时这一点尤其重要。
 func Harmony(tc *harmony.Toolchain) []kernel.Tool {
-	return []kernel.Tool{
+	tools := []kernel.Tool{
 		toolchainCheckTool{tc},
 		devicesTool{tc},
 		buildTool{tc},
@@ -33,6 +33,11 @@ func Harmony(tc *harmony.Toolchain) []kernel.Tool {
 		logsTool{tc},
 		shellTool{tc},
 	}
+	// 模拟器组（解决"没有真机时怎么测"）与工程组（补上从代码到能跑起来的环节）
+	// 各自成文件：这一组的工具数量已经多到塞在一个文件里没法读了。
+	tools = append(tools, HarmonyEmulator(tc)...)
+	tools = append(tools, HarmonyProject(tc)...)
+	return tools
 }
 
 // ---------------------------------------------------------------- 工具链探测

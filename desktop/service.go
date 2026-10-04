@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -22,11 +23,14 @@ import (
 // 并由 main.go 的 init 用 RegisterEvent 注册载荷类型；不注册的话
 // 生成的 TS 事件 API 只能拿到 any，前端就失去了类型保护。
 const (
+	evDelta            = "arkperf:delta"
 	evAssistant        = "arkperf:assistant"
 	evToolCall         = "arkperf:toolcall"
 	evToolResult       = "arkperf:toolresult"
 	evApprovalRequest  = "arkperf:approval:request"
+	evApprovalRule     = "arkperf:approval:rule"
 	evApprovalResolved = "arkperf:approval:resolved"
+	evWorkspaces       = "arkperf:workspaces" // 工作区树变了（重命名/删除会话后让前端重新拉）
 	evDone             = "arkperf:done"
 )
 
@@ -67,11 +71,31 @@ type ToolResultInfo struct {
 	IsError bool
 }
 
+// DeltaInfo 是流式输出的一个增量片段。
+type DeltaInfo struct {
+	// Kind 是 "content"（可见回答）或 "reasoning"（思考过程）。
+	// 与 kernel.DeltaKind 的字符串形式一致。
+	Kind string
+	Text string
+}
+
+// ApprovalRuleInfo 说明一次审批规则的来龙去脉，措辞由前端决定。
+type ApprovalRuleInfo struct {
+	Name  string
+	Scope string
+	Hit   bool
+	Saved bool
+	Err   string
+}
+
 // ApprovalInfo 是一次待用户决定的审批。
 type ApprovalInfo struct {
 	ID   string
 	Name string
 	Args string
+	// Scope 是这次调用的"类别"（可能为空）。界面应当把它显示出来：
+	// 用户必须清楚自己放行的是多大范围，只给工具名会让人以为是整片放行。
+	Scope string
 }
 
 // ApprovalResolved 是审批的最终结果，用于把界面上的按钮收掉。
@@ -108,12 +132,12 @@ type Service struct {
 
 	askMu   sync.Mutex
 	askSeq  int
-	pending map[string]chan bool
+	pending map[string]chan kernel.ApprovalDecision
 }
 
 // NewService 构造服务。
 func NewService() *Service {
-	return &Service{pending: map[string]chan bool{}}
+	return &Service{pending: map[string]chan kernel.ApprovalDecision{}}
 }
 
 // setApp 注入 Wails 应用句柄（用于向前端推事件）。
@@ -202,6 +226,11 @@ func (s *Service) RunTask(task string) error {
 	// Approver 与 LoopEvents 都由本服务提供：内核只认这两个接口，
 	// 所以它完全不需要知道"前端是终端还是浏览器"。
 	run := sess.NewRunner(approver{svc: s}, kernel.LoopEvents{
+		// 流式：模型的字边产边发。思考过程原样转发，
+		// 前端自己决定显示成"思考中 N 字"还是忽略。
+		OnDelta: func(kind kernel.DeltaKind, text string) {
+			s.emit(evDelta, DeltaInfo{Kind: string(kind), Text: text})
+		},
 		OnAssistant: func(text string) { s.emit(evAssistant, text) },
 		OnToolCall: func(name string, args map[string]any) {
 			s.emit(evToolCall, ToolCallInfo{Name: name, Args: compactJSON(args)})
@@ -211,6 +240,15 @@ func (s *Service) RunTask(task string) error {
 		},
 		OnApproval: func(name string, granted bool) {
 			s.emit(evApprovalResolved, ApprovalResolved{Name: name, Granted: granted})
+		},
+		OnApprovalRule: func(note kernel.ApprovalRuleNote) {
+			errText := ""
+			if note.Err != nil {
+				errText = note.Err.Error()
+			}
+			s.emit(evApprovalRule, ApprovalRuleInfo{
+				Name: note.Name, Scope: note.Scope, Hit: note.Hit, Saved: note.Saved, Err: errText,
+			})
 		},
 	})
 
@@ -246,7 +284,15 @@ func (s *Service) Interrupt() error {
 }
 
 // AnswerApproval 由前端回答审批。
-func (s *Service) AnswerApproval(id string, allow bool) error {
+//
+// decision 取 "once" / "always" / "deny"：
+//   - once  只放行这一次
+//   - always 这一类以后都不再问（**只有请求里带了 scope 时才有意义**，
+//     没有 scope 时会被当成 once 处理——内核那边记不住一个不存在的类别）
+//   - deny  拒绝
+//
+// 认不出来的值一律按 deny 处理：审批的安全缺省是拒绝，不是放行。
+func (s *Service) AnswerApproval(id string, decision string) error {
 	s.askMu.Lock()
 	ch, ok := s.pending[id]
 	s.askMu.Unlock()
@@ -254,10 +300,23 @@ func (s *Service) AnswerApproval(id string, allow bool) error {
 		return fmt.Errorf("审批请求已失效：%s", id)
 	}
 	select {
-	case ch <- allow:
+	case ch <- parseDecision(decision):
 	default: // 已经有答案了，忽略重复点击
 	}
 	return nil
+}
+
+// parseDecision 把前端传来的字符串决定转成内核的枚举。
+func parseDecision(s string) kernel.ApprovalDecision {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "once":
+		return kernel.ApprovalOnce
+	case "always":
+		return kernel.ApprovalAlways
+	default:
+		// 含空串：没选/乱传都按拒绝处理
+		return kernel.ApprovalDeny
+	}
 }
 
 // CheckToolchain 跑一次工具链探测（与命令行 `arkperf check` 同一实现）。
@@ -304,16 +363,16 @@ func (s *Service) ensureSession() (*app.Session, error) {
 // 所以 Ask（带 context、也不是给人点的）不会出现在前端 API 里。
 type approver struct{ svc *Service }
 
-func (a approver) Ask(ctx context.Context, name string, args map[string]any) (bool, error) {
-	return a.svc.ask(ctx, name, args)
+func (a approver) Ask(ctx context.Context, name string, args map[string]any, scope string) (kernel.ApprovalDecision, error) {
+	return a.svc.ask(ctx, name, args, scope)
 }
 
 // ask 把审批推给前端并**阻塞等待**回答。
 //
 // 阻塞是安全的：任务跑在独立 goroutine 里，等的是用户点按钮，不是界面线程。
-func (s *Service) ask(ctx context.Context, name string, args map[string]any) (bool, error) {
+func (s *Service) ask(ctx context.Context, name string, args map[string]any, scope string) (kernel.ApprovalDecision, error) {
 	id := s.nextAskID()
-	ch := make(chan bool, 1)
+	ch := make(chan kernel.ApprovalDecision, 1)
 
 	s.askMu.Lock()
 	s.pending[id] = ch
@@ -324,14 +383,14 @@ func (s *Service) ask(ctx context.Context, name string, args map[string]any) (bo
 		s.askMu.Unlock()
 	}()
 
-	s.emit(evApprovalRequest, ApprovalInfo{ID: id, Name: name, Args: compactJSON(args)})
+	s.emit(evApprovalRequest, ApprovalInfo{ID: id, Name: name, Args: compactJSON(args), Scope: scope})
 
 	select {
-	case allow := <-ch:
-		return allow, nil
+	case decision := <-ch:
+		return decision, nil
 	case <-ctx.Done():
 		// 用户按了中断：当作拒绝，让循环走正常的收尾路径
-		return false, ctx.Err()
+		return kernel.ApprovalDeny, ctx.Err()
 	}
 }
 
@@ -416,18 +475,53 @@ func (s *Service) SwitchSession(id string) ([]MsgLine, error) {
 }
 
 // MsgLine 是回放用的转录行。
+//
+// Name 只对 tool / result 两种角色有意义：
+//   - tool：参数串（来自 assistant 的 tool_calls，消息本身不存参数）
+//   - result：工具名（从 tool_call_id 反查，消息里只有 id）
+//
+// 「标签挂在哪一段回答上」由前端在渲染时按行序推导（每条 user 之后的第一段），
+// 不由本层传标志位——两条回放路径都要各自维护标志位，曾因此丢过一次。
 type MsgLine struct {
 	Role    string
 	Content string
+	Name    string
 }
 
-// transcriptLines 把会话消息压成可回放的转录行（tool 消息是长输出，跳过）。
+// transcriptLines 把会话消息压成可回放的转录行。
+//
+// **工具调用也必须回放**。之前只回放 user/assistant，结果"切个会话再回来，
+// 工具调用全没了"——用户看到的是残缺的对话，而且无法理解当时的结论是怎么来的。
+//
+// 顺序与实时观看时一致：assistant 文字 → 工具调用 → 工具结果。
+// 文字必须排在工具行**之前**：前端会把连续的 tool/result 行聚成一个
+// 可折叠块，文字夹在中间就会把同一轮的调用切成两截。
+// 工具名要从前面最近一条带 tool_calls 的 assistant 里反查，
+// 因为 tool 消息里只存了 tool_call_id。
 func transcriptLines(sess *app.Session) []MsgLine {
 	msgs := sess.Transcript()
 	out := make([]MsgLine, 0, len(msgs))
+	names := make(map[string]string, len(msgs)) // tool_call_id → 工具名
 	for _, m := range msgs {
-		if m.Role == "user" || m.Role == "assistant" {
-			out = append(out, MsgLine{Role: m.Role, Content: m.Content})
+		switch m.Role {
+		case "user":
+			out = append(out, MsgLine{Role: "user", Content: m.Content})
+		case "assistant":
+			// 纯工具调用的 assistant 没有文字可显示，跳过，
+			// 否则界面上会出现一个只有标签的空节点
+			if strings.TrimSpace(m.Content) != "" {
+				out = append(out, MsgLine{Role: "assistant", Content: m.Content})
+			}
+			for _, c := range m.ToolCalls {
+				names[c.ID] = c.Function.Name
+				out = append(out, MsgLine{Role: "tool", Name: c.Function.Name, Content: c.Function.Arguments})
+			}
+		case "tool":
+			name := m.ToolCallID
+			if n := names[m.ToolCallID]; n != "" {
+				name = n
+			}
+			out = append(out, MsgLine{Role: "result", Name: name, Content: m.Content})
 		}
 	}
 	return out
@@ -483,7 +577,7 @@ func (s *Service) ListWorkspaces() ([]WorkspaceChoice, error) {
 		createdAt[x.ID] = x.Created.UnixNano()
 		w.Sessions = append(w.Sessions, SessionInfo{
 			ID:      x.ID,
-			Title:   sessionTitle(x),
+			Title:   x.DisplayName(),
 			CWD:     x.CWD,
 			Updated: x.Updated.Format("01-02 15:04"),
 			Turns:   x.Turns(),
@@ -735,17 +829,66 @@ func sameDirLoose(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 }
 
-// sessionTitle 取会话的标题：第一条用户消息的首行（截 40 字）。
-// 会话没有名字字段，"首条提问"就是它最好的名字——比 ID 和时间好认得多。
-func sessionTitle(sess *kernel.Session) string {
-	for _, m := range sess.Messages {
-		if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
-			t := strings.SplitN(strings.TrimSpace(m.Content), "\n", 2)[0]
-			if r := []rune(t); len(r) > 40 {
-				t = string(r[:40]) + "…"
-			}
-			return t
-		}
+// OpenFolder 在系统资源管理器里打开一个目录（侧栏会话右键）。
+//
+// 这是**用户主动点的按钮**，不是模型发起的动作，所以不走审批——
+// 审批拦的是"模型要改东西"，不是"用户自己要看一眼"。
+// 仍然校验它确实是个目录：路径来自前端，别把任意字符串丢给 explorer。
+func (s *Service) OpenFolder(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("路径为空")
 	}
-	return "（空会话）"
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("解析路径失败：%w", err)
+	}
+	if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+		return fmt.Errorf("不是目录（可能已被移动或删除）：%s", abs)
+	}
+	// explorer 对"已经打开过"的窗口会复用，不会无限开新窗口；
+	// 加 /select, 是让它定位到该目录而不是打开它的父目录。
+	return exec.Command("explorer", "/select,"+abs).Start()
+}
+
+// RenameSession 给会话起名（侧栏"重命名"）。空串表示清除自定义名。
+func (s *Service) RenameSession(id, title string) error {
+	sess, err := s.ensureSession()
+	if err != nil {
+		return err
+	}
+	if err := sess.RenameSession(id, title); err != nil {
+		return err
+	}
+	return s.refreshAfterSidebarChange()
+}
+
+// DeleteSession 删掉一个会话（侧栏"从列表中移除"）。只删会话记录，不碰工作目录。
+func (s *Service) DeleteSession(id string) error {
+	sess, err := s.ensureSession()
+	if err != nil {
+		return err
+	}
+	s.runMu.Lock()
+	running := s.running
+	s.runMu.Unlock()
+	if running {
+		return fmt.Errorf("任务运行中，请先中断或等它结束")
+	}
+	if err := sess.DeleteSession(id); err != nil {
+		return err
+	}
+	return s.refreshAfterSidebarChange()
+}
+
+// refreshAfterSidebarChange 让前端重新拉一次工作区树。
+//
+// 列表是前端自己拉的，这里推一个事件而不是让前端在每次操作后再手动 load()——
+// 忘了 load 的话，界面就会停在旧列表上（删掉的还挂着，改名的没变）。
+func (s *Service) refreshAfterSidebarChange() error {
+	ws, err := s.ListWorkspaces()
+	if err != nil {
+		return err
+	}
+	s.emit(evWorkspaces, ws)
+	return nil
 }

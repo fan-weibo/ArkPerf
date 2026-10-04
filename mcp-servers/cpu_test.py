@@ -1,3 +1,12 @@
+"""CPU 占用测量 —— 开发阶段测试程序（第一层）。
+
+mcp-servers/ 分三层：*_core.py 公共后端逻辑 / *_server.py 给 agent 调的
+MCP 薄封装（第三层，产品入口）/ *_test.py 开发阶段测试程序（本文件）。
+
+**本文件不是产品交付路径**：给 agent 用的入口是 cpu_server.py。
+它用来在开发时手工跑一遍、直接看终端输出，绕过 MCP 协议。
+"""
+
 from cpu_core import (
     get_cpu_usage,
     judge_cpu,

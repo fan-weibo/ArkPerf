@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +19,41 @@ type Session struct {
 	Created  time.Time `json:"created"`
 	Updated  time.Time `json:"updated"`
 	Messages []Message `json:"messages"`
+	// Title 是用户自己起的名字，可空。
+	//
+	// 空时显示名回退到"第一条用户消息的首行"（见 app 层的 sessionTitle）。
+	// 不做成单独的索引文件而放进会话本身：改名跟着会话走，
+	// 删掉会话名字自然也没了，不会留下指向已删除会话的悬空条目。
+	Title string `json:"title,omitzero"`
+}
+
+// Rename 给会话起名。空串表示清除自定义名（回到自动标题）。
+func (s *Session) Rename(title string) {
+	s.Title = strings.TrimSpace(title)
+	if s.Title != "" {
+		s.Updated = time.Now()
+	}
+}
+
+// DisplayName 返回侧栏要显示的标题：用户起过的名字优先，
+// 否则回退到第一条用户消息的首行（截 40 字）。
+//
+// 放在内核而不是某个前端：三个前端都要显示它，放一处才不会出现
+// "桌面端改了名、TUI 还显示旧标题"这种分叉。
+func (s *Session) DisplayName() string {
+	if t := strings.TrimSpace(s.Title); t != "" {
+		return t
+	}
+	for _, m := range s.Messages {
+		if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
+			t := strings.SplitN(strings.TrimSpace(m.Content), "\n", 2)[0]
+			if r := []rune(t); len(r) > 40 {
+				t = string(r[:40]) + "…"
+			}
+			return t
+		}
+	}
+	return "（空会话）"
 }
 
 // Turns 返回会话里的用户轮数。
@@ -132,6 +168,18 @@ func (s *SessionStore) LatestForCWD(cwd string) *Session {
 // 不会把不同的目录判成同一个。
 func sameDir(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
+// Delete 从磁盘上删掉一个会话。
+//
+// 只删会话文件本身：它所在的目录、目录里的其他会话都不动。
+// "从列表中移除"指的是"我不再关心这段对话"，不是"把工程删了"。
+func (s *SessionStore) Delete(id string) error {
+	err := os.Remove(s.path(id))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil // 已经不在了：幂等，调用方不必区分
+	}
+	return err
 }
 
 // path 把 id 映射成文件路径。id 只可能来自我们生成的格式或会话目录里的

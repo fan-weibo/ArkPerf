@@ -96,9 +96,9 @@ func (c *Conversation) Budget() int {
 // 从历史里带一个过期的 system 只会让模型看到不存在的工具。
 func (c *Conversation) Set(transcript []Message) {
 	kept := withoutSystem(transcript)
-	// 丢掉尾部的半截轮：历史必须以 assistant 结尾，否则下一轮会拼出
-	// 连续两条 user 消息，部分端点直接拒绝。
-	kept = trimDanglingTail(kept)
+	// 修整尾部：中断/失败可能留下半截轮（没回答的 user、悬空的 tool_calls），
+	// 不修的话下一轮请求会被端点 400（实测把用户会话卡死）。
+	kept = sanitizeTail(kept)
 	if len(kept) == 0 {
 		// 这一轮没有任何可用内容（例如模型调用直接失败），什么都不改——
 		// 空转也算一轮会让状态行上的轮数骗人。
@@ -122,10 +122,11 @@ func (c *Conversation) Reset() {
 }
 
 // Restore 用已保存的历史重建会话（用于恢复上次会话）。
+// 同样要走 sanitizeTail：落盘的历史可能就是中断时存下的那份半截轮。
 func (c *Conversation) Restore(messages []Message) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.messages = compactHistory(trimDanglingTail(withoutSystem(messages)), c.maxTokens)
+	c.messages = compactHistory(sanitizeTail(withoutSystem(messages)), c.maxTokens)
 	c.turns = countTurns(c.messages)
 	c.compacted = countCompacted(c.messages)
 }
@@ -140,14 +141,50 @@ func (c *Conversation) Compacted() int {
 	return c.compacted
 }
 
-// trimDanglingTail 丢掉尾部的半截轮（没有 assistant 收尾的部分）。
+// sanitizeTail 把"任务没跑完"的尾部修成一条**合法**的历史。
 //
-// 历史必须以 assistant 结尾：否则下一轮会在末尾再拼一条 user 消息，
-// 形成连续两条 user——多数端点能忍，但有些会直接 400，而且报错跟会话
-// 结构有关，看不出是"上次任务没跑完"导致的。
-func trimDanglingTail(msgs []Message) []Message {
-	for len(msgs) > 0 && msgs[len(msgs)-1].Role != "assistant" {
+// 这里曾经有个真 bug（实测把用户会话卡死）：旧逻辑只删尾部的非 assistant，
+// 结果把工具的回复删了、却保留了带着 tool_calls 的 assistant——
+// 下一轮请求就是"assistant 带 tool_calls 却没有 tool 回复"，
+// DeepSeek 直接 400，而且这条历史已落盘，**之后每一条消息都炸**，
+// 用户看到的是"中断一次，这个会话就再也说不了话了"。
+//
+// 正确做法分两步：
+//  1. 丢掉尾部没被回答的 user（真正的半截轮）；
+//  2. **补齐**悬空的 tool_calls，而不是删掉它们——给每个没被回答的
+//     tool_call_id 合成一条"已被中断"的 tool 回复。这样历史保持完整，
+//     模型也知道上一次执行是被中断的，而不是凭空少了一段。
+//
+// 合法性判据不是"以 assistant 结尾"，而是：
+// 每个 assistant 的 tool_calls 都有对应的 tool 回复，且没有连续两条 user。
+func sanitizeTail(msgs []Message) []Message {
+	// 1) 尾部没被回答的 user：中断发生在模型开口之前
+	for len(msgs) > 0 && msgs[len(msgs)-1].Role == "user" {
 		msgs = msgs[:len(msgs)-1]
+	}
+
+	// 2) 找最后一条带 tool_calls 的 assistant，补上缺的回复
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "assistant" || len(msgs[i].ToolCalls) == 0 {
+			continue
+		}
+		answered := make(map[string]bool, len(msgs[i].ToolCalls))
+		for _, m := range msgs[i+1:] {
+			if m.Role == "tool" && m.ToolCallID != "" {
+				answered[m.ToolCallID] = true
+			}
+		}
+		for _, call := range msgs[i].ToolCalls {
+			if answered[call.ID] {
+				continue
+			}
+			msgs = append(msgs, Message{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Content:    "（任务被用户中断，这次调用没有执行完，没有得到结果）",
+			})
+		}
+		break // 悬空只可能发生在最后一条带 tool_calls 的 assistant 上
 	}
 	return msgs
 }

@@ -37,29 +37,48 @@ func NewApprover(in io.Reader, out io.Writer, auto bool) *Approver {
 
 // Ask 询问一次。非交互式 stdin（管道、CI、重定向）一律驳回：
 // 没有人能回答的时候，安全缺省是拒绝，而不是默默放行。
-func (a *Approver) Ask(ctx context.Context, name string, args map[string]any) (bool, error) {
+//
+// scope 非空时多给一个 [a]："这一类以后都不问"。**必须把类别原样显示出来**——
+// 只显示工具名的话，"总是允许"会被理解成"永远允许这个工具"，
+// 而实际范围可能小得多（比如只是某个目录），也可能大得多。
+func (a *Approver) Ask(ctx context.Context, name string, args map[string]any, scope string) (kernel.ApprovalDecision, error) {
 	if a.Auto {
 		fmt.Fprintf(a.Out, "⚡ 自动批准 %s %s\n", name, compact(args))
-		return true, nil
+		return kernel.ApprovalOnce, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return kernel.ApprovalDeny, err
 	}
 	if !isInteractive(a.In) {
 		fmt.Fprintf(a.Out, "⚠ %s 需要审批，但 stdin 不是交互终端 → 已驳回（如需放行请加 --yes）\n", name)
-		return false, nil
+		return kernel.ApprovalDeny, nil
 	}
 
-	fmt.Fprintf(a.Out, "⚠ 允许执行 %s %s ? [y/N] ", name, compact(args))
+	fmt.Fprintf(a.Out, "⚠ 允许执行 %s %s ?\n", name, compact(args))
+	if scope != "" {
+		fmt.Fprintf(a.Out, "  类别：%s\n", scope)
+		fmt.Fprint(a.Out, "  [y] 允许一次　[a] 这一类以后都不问　[N] 拒绝 > ")
+	} else {
+		fmt.Fprint(a.Out, "  [y] 允许一次　[N] 拒绝 > ")
+	}
+
 	line, err := a.reader().ReadString('\n')
 	if err != nil && line == "" {
-		return false, err
+		return kernel.ApprovalDeny, err
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
-		return true, nil
+		return kernel.ApprovalOnce, nil
+	case "a", "always":
+		if scope == "" {
+			// 没有可记忆的类别，只能放行这一次。必须说出来，
+			// 否则用户以为已经一劳永逸，下次被再问一遍只会觉得功能坏了。
+			fmt.Fprint(a.Out, "  这一次没有可记忆的类别（这类调用每次都不一样），只放行本次\n")
+			return kernel.ApprovalOnce, nil
+		}
+		return kernel.ApprovalAlways, nil
 	default:
-		return false, nil
+		return kernel.ApprovalDeny, nil
 	}
 }
 

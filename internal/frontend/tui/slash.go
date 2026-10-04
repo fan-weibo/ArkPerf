@@ -30,9 +30,11 @@ func commands() []SlashCommand {
 	return []SlashCommand{
 		{Name: "help", Help: "列出所有命令与按键", Run: cmdHelp},
 		{Name: "tools", Help: "列出已注册的工具", Run: cmdTools},
+		{Name: "skills", Help: "列出技能（三层目录、来源路径、被跳过的）", Run: cmdSkills},
 		{Name: "check", Help: "探测 OpenHarmony 工具链", Run: cmdCheck},
 		{Name: "devices", Help: "列出已连接的设备", Run: cmdDevices},
 		{Name: "yes", Help: "切换自动批准（免确认执行危险工具）", Run: cmdYes},
+		{Name: "rules", Help: "查看已保存的审批规则（哪些类别不再询问）", Run: cmdRules},
 		{Name: "status", Help: "显示当前装配状态", Run: cmdStatus},
 		{Name: "new", Help: "开始新会话（清空模型上下文）", Run: cmdNew},
 		{Name: "cd", Help: "切换工作目录（工作区，会换成该目录的会话）", Run: cmdCd},
@@ -118,6 +120,22 @@ func cmdTools(m *Model, _ string) tea.Cmd {
 	return m.print(strings.Join(lines, "\n"))
 }
 
+// cmdSkills 列出技能：三层目录、每个技能的来源路径、以及被跳过的坏文件与原因。
+//
+// 技能是**纯数据**——加一个技能不用改代码，往目录里丢个文件夹就行。
+// 代价是"我放进去为什么没生效"变成最高频的问题，而它对用户是完全不可见的：
+// 模型不会说"我没读到你的技能"，它只会答得不如预期。
+// 所以这一条命令把三层目录、胜出者路径、跳过原因全打出来，让人自己就能定位。
+//
+// 同步执行（不像 /check 那样丢后台）：只读三层目录、十几毫秒，
+// 为它绕一圈异步反而让输出顺序变得不确定。
+func cmdSkills(m *Model, _ string) tea.Cmd {
+	if m.opts.SkillReport == nil {
+		return m.print(styleDim.Render("（技能清单不可用）"))
+	}
+	return m.print(m.opts.SkillReport())
+}
+
 // cmdCheck 探测工具链。会用 ProbeVersion 起子进程，所以放到后台执行。
 func cmdCheck(m *Model, _ string) tea.Cmd {
 	if m.opts.ToolchainReport == nil {
@@ -160,6 +178,18 @@ func cmdYes(m *Model, _ string) tea.Cmd {
 	return m.print(styleDim.Render("已关闭自动批准：需要审批的工具会先询问"))
 }
 
+// cmdRules 列出"以后别再问"的记忆。
+//
+// 为什么必须有这条命令：规则的作用是**减少询问**，所以一条过宽的规则
+// 是静默的——不会有任何提示告诉用户"你上次放行的那一类其实很宽"。
+// 有一个地方能看见自己放行了什么，是这类功能的基本要求。
+func cmdRules(m *Model, _ string) tea.Cmd {
+	if m.opts.RulesReport == nil {
+		return m.print(styleDim.Render("（审批规则不可用）"))
+	}
+	return m.print(m.opts.RulesReport())
+}
+
 func cmdStatus(m *Model, _ string) tea.Cmd {
 	lines := []string{styleBold.Render("装配状态")}
 	add := func(k, v string) {
@@ -169,6 +199,9 @@ func cmdStatus(m *Model, _ string) tea.Cmd {
 	}
 	add("模型", m.opts.ModelName)
 	add("工具", fmt.Sprintf("%d 个", m.opts.ToolCount))
+	if m.opts.SkillSummary != nil {
+		add("技能", m.opts.SkillSummary())
+	}
 	add("工具链", m.opts.Toolchain)
 	add("MCP", m.opts.MCP)
 	if m.bridge.AutoApprove() {

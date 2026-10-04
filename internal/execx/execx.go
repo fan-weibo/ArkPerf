@@ -143,6 +143,35 @@ func Run(ctx context.Context, name string, args []string, opts Options) (Result,
 	return res, nil
 }
 
+// StartDetached 启动一个长期运行的进程并立即返回，不等它结束。
+//
+// 专给"启动后要一直活着"的程序（如模拟器）。这里**刻意**不用
+// `cmd /c start /B`：那要把参数拼回一行命令行，一旦参数里有空格
+// （实例名 "Pura 90" 就有），引号就会丢，子进程把 "Pura 90" 拆成两个参数，
+// 然后以退出码 0 静默退出—— stderr 上还只有一句 "Invalid command"。
+// 直接 Start + Release 传的是参数数组，不存在这一整类问题。
+//
+// 返回 pid 供调用方观察；进程与调用方生命周期无关，父进程退出不会带走它。
+func StartDetached(name string, args []string, opts Options) (int, error) {
+	if strings.TrimSpace(name) == "" {
+		return 0, fmt.Errorf("%w: 命令名为空", ErrStart)
+	}
+	realName, realArgs := commandLine(name, args)
+	cmd := exec.Command(realName, realArgs...)
+	HideWindow(cmd)
+	cmd.Dir = opts.Dir
+	cmd.Env = childEnv(opts.Env)
+	cmd.Stdin = nil
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("%w: %s: %w", ErrStart, Display(name, args), err)
+	}
+	pid := cmd.Process.Pid
+	// Release 放弃等待：进程已交给系统，我们不再持有它的退出状态。
+	// 失败也不影响"已经启动"这个事实，所以只忽略不报错。
+	_ = cmd.Process.Release()
+	return pid, nil
+}
+
 // commandLine 把 .bat/.cmd 包进 cmd.exe。
 //
 // Windows 的 CreateProcess 不能直接执行批处理文件，而 DevEco 的

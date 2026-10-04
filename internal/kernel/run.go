@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/fan-weibo/ArkPerf/internal/skill"
 )
 
 // Task 是一次任务的输入。
@@ -24,6 +26,12 @@ type Task struct {
 	Approval string
 	// MaxTurns 覆盖配置里的轮次上限。0 表示沿用配置。
 	MaxTurns int
+	// Skills 是这次任务可用的技能，覆盖 Runner.Skills。
+	//
+	// 按次给而不是只给 Runner，理由与 CWD 相同：同一个 Runner 会被前端
+	// 复用，而用户切了工作区之后，下一次任务就该用新目录下的技能。
+	// nil 表示沿用 Runner.Skills；传非 nil 的空切片表示"这次不用技能"。
+	Skills []skill.Skill
 }
 
 // Runner 把配置、工具注册表、审批通道与输出组装成一次可执行的任务。
@@ -55,6 +63,13 @@ type Runner struct {
 	// Chat 覆盖模型调用（nil 则按 Cfg.Provider 构造）。
 	// 与 LoopConfig.Chat 同源：有了它，Runner+Conversation 这条链路也能离线测。
 	Chat ChatFunc
+	// Skills 是默认技能集（按工作目录解析出来的一组技能）。
+	//
+	// 为空表示不带技能。Task.Skills 可按次覆盖——同一个 Runner 被复用
+	// 而工作区变了的时候，需要换一组技能。
+	Skills []skill.Skill
+	// Rules 是"以后别再问"的审批记忆。为空表示不做记忆（每次都问）。
+	Rules *ApprovalRules
 }
 
 // Run 执行一次任务。
@@ -94,6 +109,15 @@ func (r *Runner) Run(ctx context.Context, t Task) (LoopResult, error) {
 		chat = NewClient(r.Cfg.Provider).Chat
 	}
 
+	// 技能：Task 按次指定 > Runner 默认。与 cwd 同一套覆盖顺序。
+	//
+	// 这里不能用 cmp.Or：切片不可比较。用 nil 判断而不是长度判断，
+	// 是因为"这次明确不用技能"（非 nil 的空切片）必须能与"没指定"区分开。
+	skills := r.Skills
+	if t.Skills != nil {
+		skills = t.Skills
+	}
+
 	res, runErr := RunLoop(ctx, LoopConfig{
 		Registry: r.Registry,
 		Ctx:      ToolCtx{CWD: cwd, Home: Home()},
@@ -103,6 +127,8 @@ func (r *Runner) Run(ctx context.Context, t Task) (LoopResult, error) {
 		Approver: r.Approver,
 		Events:   events,
 		History:  history,
+		Skills:   skills,
+		Rules:    r.Rules,
 	}, t.Text)
 
 	// 把这一轮并入会话。所有收尾路径都过这里（含中断与失败）：
@@ -121,11 +147,26 @@ func (r *Runner) defaultEvents() LoopEvents {
 		out = os.Stdout
 	}
 
-	events := LoopEvents{
-		OnAssistant: func(text string) { fmt.Fprintln(out, text) },
-	}
 	if r.SilenceProgress {
-		return events
+		// 静默模式只输出最终回答：因此**不挂 OnDelta**，模型走一次性路径，
+		// OnAssistant 拿到的就是唯一一次输出。挂上它反而会把中间过程也打出来。
+		return LoopEvents{
+			OnAssistant: func(text string) { fmt.Fprintln(out, text) },
+		}
+	}
+
+	// 交互模式走流式：字边产边出，而不是等整段说完。
+	events := LoopEvents{
+		OnDelta: func(kind DeltaKind, text string) {
+			// 只打可见回答。思考过程刻意不打：这条路径的 stdout 常常被脚本
+			// 接走（`arkperf "任务" > 报告.txt`），把思考混进去会污染结果。
+			if kind == DeltaContent {
+				fmt.Fprint(out, text)
+			}
+		},
+		// 流式之后 OnAssistant 退化成"收尾换行"：文本已经在屏幕上了，
+		// 再打一遍就是同一段话出现两次。
+		OnAssistant: func(string) { fmt.Fprintln(out) },
 	}
 	events.OnToolCall = func(name string, args map[string]any) {
 		fmt.Fprintf(out, "→ %s %s\n", name, compactArgs(args))

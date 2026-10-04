@@ -20,7 +20,19 @@ func names(tools []kernel.Tool) []string {
 
 func TestHarmonyExposesExpectedTools(t *testing.T) {
 	got := strings.Join(names(Harmony(nil)), ",")
-	want := "harmony_toolchain_check,harmony_devices,harmony_build,harmony_install,harmony_launch,harmony_logs,harmony_shell"
+	want := strings.Join([]string{
+		// 基础链路
+		"harmony_toolchain_check", "harmony_devices", "harmony_build",
+		"harmony_install", "harmony_launch", "harmony_logs", "harmony_shell",
+		// 模拟器组
+		"harmony_emulator_list", "harmony_emulator_catalog", "harmony_image_check",
+		"harmony_emulator_start", "harmony_emulator_stop",
+		"harmony_emulator_create", "harmony_emulator_delete",
+		// 工程与设备组
+		"harmony_uninstall", "harmony_project_profile", "harmony_schema_check",
+		"harmony_build_doctor", "harmony_api_lookup", "harmony_sign", "harmony_lint",
+		"harmony_device_test", "harmony_ui_regression",
+	}, ",")
 	if got != want {
 		t.Fatalf("tools:\n got %s\nwant %s", got, want)
 	}
@@ -49,6 +61,24 @@ func TestApprovalMatrix(t *testing.T) {
 		"harmony_install":         true, // 改变设备状态
 		"harmony_launch":          true,
 		"harmony_shell":           true,
+		// 模拟器：查与看免审批，动进程/改文件要审批
+		"harmony_emulator_list":    false,
+		"harmony_emulator_catalog": false,
+		"harmony_image_check":      false,
+		"harmony_emulator_start":   true, // 拉起长期运行的进程
+		"harmony_emulator_stop":    true, // 结束进程
+		"harmony_emulator_create":  true, // 写模拟器目录与清单
+		"harmony_emulator_delete":  true, // 破坏性
+		// 工程与设备：读工程免审批，改设备/产文件要审批
+		"harmony_uninstall":       true, // 删除设备上的应用
+		"harmony_project_profile": false,
+		"harmony_schema_check":    false,
+		"harmony_build_doctor":    true, // 空参数下会自己跑一次构建（矩阵用空参数测）
+		"harmony_api_lookup":      false,
+		"harmony_sign":            true, // 生成新文件
+		"harmony_lint":            false,
+		"harmony_device_test":     true, // 装机+启动+卸载
+		"harmony_ui_regression":   true, // 启动应用
 	}
 
 	for _, tool := range Harmony(nil) {

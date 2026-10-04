@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -17,6 +18,7 @@ import (
 	"github.com/fan-weibo/ArkPerf/internal/frontend/tui"
 	"github.com/fan-weibo/ArkPerf/internal/kernel"
 	"github.com/fan-weibo/ArkPerf/internal/mcp"
+	"github.com/fan-weibo/ArkPerf/internal/skill"
 	"github.com/spf13/cobra"
 )
 
@@ -83,11 +85,31 @@ func newRootCmd() *cobra.Command {
 				reportMCP(out, set)
 			}
 
+			// 技能按工作目录解析。一次性执行没有显式工作区，
+			// 就用进程 CWD——与 Runner 回退到进程 CWD 的口径一致，
+			// 否则会出现"提示词里的技能来自 A 目录、工具却跑在 B 目录"。
+			cwd, wdErr := os.Getwd()
+			if wdErr != nil {
+				cwd = "."
+			}
+			skills, skillDiags := app.SkillsFor(cwd)
+			app.WarnSkillDiagnostics(skillDiags)
+			reportSkills(out, skills)
+
+			// 审批规则：与 TUI 那条路径同源。读坏了不覆盖、不假装没有。
+			rules, rulesErr := kernel.LoadApprovalRules(kernel.ApprovalRulesPath())
+			if rulesErr != nil {
+				fmt.Fprintf(os.Stderr, "arkperf: %v（本次按「每次都问」处理）\n", rulesErr)
+				rules = nil
+			}
+
 			runner := &kernel.Runner{
 				Cfg:      cfg,
 				Registry: reg,
 				Approver: cli.NewApprover(os.Stdin, out, flagAutoApprove),
 				Out:      out,
+				Skills:   skills,
+				Rules:    rules,
 			}
 
 			res, err := runner.Run(cmd.Context(), kernel.Task{
@@ -110,7 +132,7 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().IntVar(&flagMaxTurns, "max-turns", 0, "覆盖配置里的轮次上限")
 	root.PersistentFlags().BoolVar(&flagNoMCP, "no-mcp", false, "不连接 MCP 服务器（只用本地工具）")
 
-	root.AddCommand(versionCmd(), initCmd(), configCmd(), toolsCmd(), mcpCmd(), checkCmd(), devicesCmd(), tuiCmd())
+	root.AddCommand(versionCmd(), initCmd(), configCmd(), toolsCmd(), toolCmd(), skillsCmd(), rulesCmd(), mcpCmd(), checkCmd(), devicesCmd(), tuiCmd())
 	root.Version = version
 	return root
 }
@@ -137,6 +159,30 @@ func reportMCP(out io.Writer, set *mcp.Set) {
 	for _, r := range set.Failed() {
 		fmt.Fprintf(out, "[mcp] ✗ %s: %v\n", r.Name, r.Err)
 	}
+}
+
+// reportSkills 打印技能装载情况。
+//
+// 与 toolchain 同理：技能是外部输入，写坏了只跳过不报错，所以必须有一个
+// 地方能让人看见"到底加载了几个、从哪加载的"。不打印的话，
+// 用户唯一的观察窗口是模型的回答，而"技能没生效"在回答里看不出来。
+func reportSkills(out io.Writer, skills []skill.Skill) {
+	fmt.Fprintf(out, "[skill] %s\n", app.SkillSummary(skills))
+	// 只有内置技能时提醒一句：用户往工程里放了技能却发现没生效，
+	// 最常见的原因就是放错了目录（放在工程根而不是 .arkperf/skills 下）。
+	if len(skills) > 0 && allBuiltin(skills) {
+		fmt.Fprintf(out, "[skill] 以上均来自内置目录；自定义技能放 <工作区>/.arkperf/skills/<名字>/SKILL.md\n")
+	}
+}
+
+// allBuiltin 判断是否全部来自内置目录。
+func allBuiltin(skills []skill.Skill) bool {
+	for _, s := range skills {
+		if s.Source != skill.SourceBuiltin {
+			return false
+		}
+	}
+	return true
 }
 
 func versionCmd() *cobra.Command {
@@ -232,6 +278,50 @@ func configCmd() *cobra.Command {
 	return c
 }
 
+// skillsCmd 列出三层技能目录与各自解析出的技能。
+//
+// 为什么要有这个入口：技能是纯数据，加一个技能不用改代码，所以"我放进去
+// 为什么没生效"是最高频的问题。这里把三层目录、每个技能的来源路径、
+// 以及被跳过的坏文件连同原因一起打出来——用户自己就能定位，
+// 不必反过来问我们。
+func skillsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "skills",
+		Short: "列出三层技能目录与解析出的技能",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cwd, err := os.Getwd()
+			if err != nil {
+				cwd = "."
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), app.SkillReport(cwd))
+			return nil
+		},
+	}
+}
+
+// rulesCmd 列出已保存的审批规则。
+//
+// 规则只减少询问，一条过宽的规则是静默的陷阱，所以要有地方能看见。
+// **删除只能手改文件**：现在没有删除命令——等真的有人需要"按类别撤销"
+// 再加，而不是先造一个自己也不确定语义的子命令。
+func rulesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "rules",
+		Short: "列出已保存的审批规则（哪些类别不再询问）",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path := kernel.ApprovalRulesPath()
+			rules, err := kernel.LoadApprovalRules(path)
+			if err != nil {
+				// 读坏了就把原因原样打出来：它比"没有规则"重要得多
+				fmt.Fprintf(cmd.OutOrStdout(), "%v\n", err)
+				return nil
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), app.ApprovalRulesSummary(rules))
+			return nil
+		},
+	}
+}
+
 func toolsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tools",
@@ -259,6 +349,153 @@ func toolsCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// toolCmd 直接调用一个工具。
+//
+// 为什么要有这个入口：工具本来是给模型调的，但"这个工具在本机到底跑不跑得通"
+// 只能靠真跑一次来回答。以前要么写 Go 测试、要么在 TUI 里让模型去调
+// （还得先配好模型）——排障成本高到实际上没人去做，于是"工具坏了"往往
+// 直到 Agent 卡住才被发现。
+//
+// 审批**不绕过**：走的是与正常运行同一个 cli.Approver，所以不带 --yes 时
+// 会在终端询问，非交互环境（管道 / CI）一律按拒绝处理。
+func toolCmd() *cobra.Command {
+	var argsJSON string
+
+	c := &cobra.Command{
+		Use:   "tool <名字> [参数JSON]",
+		Short: "直接调用一个本地工具（调试用，参数以 JSON 给出）",
+		Long: "不经过模型，直接执行一个工具并打印结果。用于验证工具在本机是否可用。\n\n" +
+			"  arkperf tool harmony_emulator_list\n" +
+			"  arkperf tool harmony_api_lookup '{\"symbol\":\"UIAbility\"}'\n" +
+			"  arkperf tool harmony_emulator_start '{\"name\":\"Pura 90\"}' --yes\n\n" +
+			"需要审批的工具会照常询问（非交互环境一律拒绝）；只读工具直接执行。",
+		Args: cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			name := strings.TrimSpace(args[0])
+
+			raw := argsJSON
+			if len(args) > 1 {
+				raw = args[1] // 位置参数优先于 --args，命令行上更顺手
+			}
+			params := map[string]any{}
+			if strings.TrimSpace(raw) != "" {
+				if err := json.Unmarshal([]byte(raw), &params); err != nil {
+					return fmt.Errorf("参数不是合法 JSON 对象：%w\n示例：arkperf tool %s '{\"key\":\"value\"}'", err, name)
+				}
+			}
+
+			reg := app.NewRegistry()
+			tool, ok := reg.Get(name)
+			if !ok {
+				return fmt.Errorf("没有名为 %q 的本地工具。%s（用 `arkperf tools` 看全部；MCP 工具不在其中）",
+					name, suggestTool(reg, name))
+			}
+
+			if tool.NeedsApproval(params) {
+				// 这条路径绕开了循环、直接调工具，所以审批与"规则记忆"都得自己做一遍。
+				// 关键是**用同一个类别算法**：两条路径算出不同类别的话，
+				// 用户在 TUI 里记住的规则到这里就不生效，而现象是
+				// "我明明设过了，它怎么还问我"。
+				cwd, _ := os.Getwd()
+				scope := kernel.ApprovalScope(tool, params, cwd)
+				rules, rulesErr := kernel.LoadApprovalRules(kernel.ApprovalRulesPath())
+				if rulesErr != nil {
+					// 读坏了不覆盖、也不假装没有：说清楚，并按"每次都问"继续
+					fmt.Fprintf(os.Stderr, "arkperf: %v（本次按「每次都问」处理）\n", rulesErr)
+					rules = nil
+				}
+
+				if rules.Allowed(name, scope) {
+					fmt.Fprintf(out, "按已保存的规则放行 %s（%s）\n", name, scope)
+				} else {
+					approver := cli.NewApprover(cmd.InOrStdin(), out, flagAutoApprove)
+					decision, err := approver.Ask(cmd.Context(), name, params, scope)
+					if err != nil {
+						// 管道 / CI / 重定向时读不到回答，审批器会返回 EOF 之类的原始错误。
+						// 直接把它抛出去，用户看到的是 "arkperf: EOF"——完全看不懂。
+						// 必须翻译成"发生了什么 + 怎么办"。
+						return fmt.Errorf("%s 需要审批，但当前不是交互式终端（%v），已按拒绝处理；"+
+							"确认要执行请显式加 --yes", name, err)
+					}
+					if !decision.Granted() {
+						return fmt.Errorf("%s 未获批准，未执行", name)
+					}
+					if decision == kernel.ApprovalAlways && scope != "" {
+						if err := rules.Remember(name, scope); err != nil {
+							// 这次已经放行了，只是没记住；必须说出来，
+							// 否则用户以为已经生效，下次却被再问一遍
+							fmt.Fprintf(os.Stderr, "arkperf: 规则没能保存：%v\n", err)
+						} else {
+							fmt.Fprintf(out, "已记住：%s 的「%s」以后不再询问\n", name, scope)
+						}
+					}
+				}
+			}
+
+			cwd, err := os.Getwd()
+			if err != nil {
+				cwd = ""
+			}
+			res, err := tool.Execute(cmd.Context(), params, kernel.ToolCtx{CWD: cwd, Home: kernel.Home()})
+			if err != nil {
+				return err // 这是"工具坏了"，由上层统一打印
+			}
+			fmt.Fprintln(out, res.Output)
+			if res.IsError {
+				// 业务失败也要有非 0 退出码：否则脚本里看不出成败
+				return fmt.Errorf("%s 返回错误（输出见上）", name)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&argsJSON, "args", "", `参数 JSON，如 '{"symbol":"UIAbility"}'`)
+	return c
+}
+
+// 名字里的通用词：它们出现在几乎每个工具名里，拿来做匹配会得到一堆无用候选。
+var toolNameStopWords = map[string]bool{"harmony": true, "file": true, "list": true}
+
+// suggestTool 给拼错的工具名一个提示。
+//
+// 匹配用"名字片段的前 6 个字符"而不是整段相等：这样少写一个字母
+// （emulater → emulator）也能命中，又不至于退化成"所有 harmony_ 工具都算候选"。
+//
+// 不实现编辑距离：工具名长且规律，前缀匹配已经够用，
+// 而且不会给出"看起来很像其实不是"的错误建议。
+func suggestTool(reg *kernel.Registry, name string) string {
+	parts := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return r == '_' || r == '-' || r == ' ' || r == '.'
+	})
+	var hits []string
+	for _, n := range reg.Names() {
+		if n == name {
+			continue
+		}
+		low := strings.ToLower(n)
+		for _, p := range parts {
+			if len(p) < 4 || toolNameStopWords[p] {
+				continue
+			}
+			stem := p
+			if len(stem) > 6 {
+				stem = stem[:6]
+			}
+			if strings.Contains(low, stem) {
+				hits = append(hits, n)
+				break
+			}
+		}
+		if len(hits) >= 3 {
+			break
+		}
+	}
+	if len(hits) == 0 {
+		return ""
+	}
+	return "是不是想找：" + strings.Join(hits, " / ")
 }
 
 func mcpCmd() *cobra.Command {
@@ -389,6 +626,12 @@ func tuiCmd() *cobra.Command {
 				SessionCompacted: sess.Compacted,
 				ResetSession:     sess.Reset,
 				StartupNotice:    notice,
+				// /skills：用闭包而不是取一次固定值——工作目录会随 /cd 变，
+				// 而项目级技能就挂在 <工作目录>/.arkperf/skills 下
+				SkillReport:  func() string { return app.SkillReport(sess.CWD()) },
+				SkillSummary: sess.SkillSummary,
+				// /rules：审批规则的清单（含"怎么删"）
+				RulesReport: func() string { return app.ApprovalRulesSummary(sess.ApprovalRules()) },
 				// /cd：切工作目录，返回切换后的目录（失败如实抛出，让 TUI 显示原因）
 				SwitchWorkspace: func(path string) (string, error) {
 					if err := sess.SetWorkspace(path); err != nil {

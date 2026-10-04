@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
@@ -117,6 +118,28 @@ type Model struct {
 	// 头部只在轮首打一次，后续段落是同一轮的延续。
 	// startTask（含排队任务启动）与 /clear 时复位。
 	assistantOpen bool
+
+	// 流式输出用的三个字段。
+	//
+	// 做法是**在转录里维护一个"活的块"**：每收到一段增量就按当前文本重渲染
+	// 那一块（而不是每段都追加新行）。这样做的理由：alt-screen 布局下转录
+	// 是每帧整体重画的，改写一个内存元素不需要任何新机制；
+	// 而"追加新行"会让同一句话被折行规则切得七零八落，定稿时还得回头清理。
+	//
+	// streamIdx 是那一块在 transcript 里的下标，-1 表示当前没有正在流的块。
+	streamIdx int
+	streamBuf string
+	// streamHead 是活块开头那行（"◆ arkperf"）。开块时决定一次并留用，
+	// 定稿时不能重新判断——那时 assistantOpen 已被置位。
+	streamHead string
+	// reasoningChars 是本次思考过程已收到的字符数，用于在运行指示行给出反馈。
+	// 思考过程本身**不进转录**：它常常比回答长一个数量级，全量留在转录里
+	// 会把真正的结论冲得看不见（要展开看是以后加折叠视图的事）。
+	reasoningChars int
+
+	// approvalNote 是审批刚过去时要说的一句补充说明
+	// （例如"没有可记忆的类别，只放行了本次"）。
+	approvalNote string
 }
 
 // NewModel 构造 TUI 模型。
@@ -161,6 +184,9 @@ func NewModel(ctx context.Context, o Options, b *Bridge) *Model {
 		// 默认开着鼠标捕获：滚轮/滚动条可用，选中由 app 自己实现
 		// （左键拖拽→反色高亮→松手自动复制）。学自 Reasonix。
 		mouseCaptureOff: false,
+		// -1 表示"当前没有正在流的块"。零值是 0，会被误当成"第一块"，
+		// 所以必须显式初始化。
+		streamIdx: -1,
 	}
 	if o.NewAgent != nil {
 		m.run = o.NewAgent(b, b.Events())
@@ -271,6 +297,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) resetViewState() {
 	m.transcript = nil
 	m.assistantOpen = false
+	m.closeStream()
 	m.sel = selection{}
 }
 
@@ -448,8 +475,30 @@ func clamp(v, lo, hi int) int {
 
 func (m *Model) handleEvent(e event) (tea.Model, tea.Cmd) {
 	switch e.kind {
+	case evDelta:
+		return m.handleDelta(e)
+
 	case evAssistant:
 		text := strings.TrimSpace(e.text)
+		// 流式已经把它显示出来了：这里只做定稿，不再打第二遍。
+		if m.streamIdx >= 0 {
+			idx := m.streamIdx
+			head := m.streamHead
+			m.closeStream()
+			if text == "" {
+				// 流出来又变空（端点补正过内容）：整块撤掉，别在转录里留一行空白
+				if idx < len(m.transcript) {
+					m.transcript = append(m.transcript[:idx], m.transcript[idx+1:]...)
+				}
+				return m, nil
+			}
+			// 用**最终文本**重渲染一次：增量与完整文本有出入时以完整文本为准，
+			// 否则屏幕上留下的会和下一轮上下文里的不一样。
+			if idx < len(m.transcript) {
+				m.transcript[idx] = head + renderAssistant(text, m.contentWidth())
+			}
+			return m, nil
+		}
 		if text == "" {
 			return m, nil
 		}
@@ -494,14 +543,104 @@ func (m *Model) handleEvent(e event) (tea.Model, tea.Cmd) {
 		m.input.Blur()
 		return m, nil
 
+	case evApprovalRule:
+		// 命中规则、刚记住、没记住——三种情况都要说出来。
+		// 尤其是"命中"：用户看到工具直接跑了却没被问，唯一能解释它的就是这一句。
+		if e.rule.Err != nil {
+			return m, m.print(styleWarn.Render(approvalRuleText(e.rule)))
+		}
+		return m, m.print(styleDim.Render(approvalRuleText(e.rule)))
+
 	case evDone:
 		return m.finish(e)
 	}
 	return m, nil
 }
 
+// approvalRuleText 是审批规则的措辞。内核只给结构化的事实，话由前端来说。
+func approvalRuleText(n kernel.ApprovalRuleNote) string {
+	switch {
+	case n.Err != nil:
+		return fmt.Sprintf("〔审批〕规则没能保存（%v）——这次已放行，但下次还会问你", n.Err)
+	case n.Saved:
+		return fmt.Sprintf("〔审批〕已记住：%s 的「%s」以后不再询问（/rules 可查看）", n.Name, n.Scope)
+	case n.Hit:
+		return fmt.Sprintf("〔审批〕按已保存的规则放行 %s（%s）", n.Name, n.Scope)
+	default:
+		return "〔审批〕规则状态未知"
+	}
+}
+
+// handleDelta 处理流式增量。
+//
+// 可见内容与思考过程区别对待：
+//   - 可见内容进转录的"活块"，每段增量重渲染那一块；
+//   - 思考过程不进转录，只把字数反映到运行指示行上。
+//
+// 后者是刻意的：思考过程常常比回答长一个数量级，全量留在转录里会把
+// 真正的结论冲得看不见。要展开看是以后加折叠视图的事，现在先把
+// "它在想"这件事变得可见就够了。
+func (m *Model) handleDelta(e event) (tea.Model, tea.Cmd) {
+	if e.delta == kernel.DeltaReasoning {
+		m.reasoningChars += utf8.RuneCountInString(e.text)
+		return m, nil
+	}
+	if m.streamIdx < 0 {
+		m.openStreamBlock()
+	}
+	// 一旦开始产出可见内容，思考阶段就结束了
+	m.reasoningChars = 0
+	m.streamBuf += e.text
+	m.renderStreamBlock()
+	return m, nil
+}
+
+// openStreamBlock 开一个活的块，并把头部行决定一次。
+//
+// 头部（"◆ arkperf"）只在这里判断一次并记下来：定稿时要复用同一个前缀，
+// 而那时 assistantOpen 已经被置位，重新判断会得到"没有头部"的错误结论，
+// 表现为块内容凭空往前缩了一行。
+func (m *Model) openStreamBlock() {
+	if m.assistantOpen {
+		m.streamHead = ""
+	} else {
+		m.assistantOpen = true
+		m.turns++
+		m.streamHead = styleAccent.Render(agentMarker+" arkperf") + "\n"
+	}
+	m.streamBuf = ""
+	m.transcript = append(m.transcript, m.streamHead)
+	m.streamIdx = len(m.transcript) - 1
+}
+
+// renderStreamBlock 用当前缓冲重渲染活块。
+//
+// 每段增量都整块重渲染，而不是往后追加：追加会被折行规则切碎，
+// 定稿时还得回头把碎片收拾干净。整块重渲染的代价是 O(文本长度)，
+// 对一次回答的体量（几 KB）完全可以忽略。
+func (m *Model) renderStreamBlock() {
+	if m.streamIdx < 0 || m.streamIdx >= len(m.transcript) {
+		m.streamIdx = -1 // 被 transcriptCap 裁掉了：下一段增量重开一块
+		return
+	}
+	body := renderAssistant(strings.TrimSpace(m.streamBuf), m.contentWidth())
+	m.transcript[m.streamIdx] = m.streamHead + body
+}
+
+// closeStream 收尾并复位流式状态。可重复调用。
+func (m *Model) closeStream() {
+	m.streamIdx = -1
+	m.streamBuf = ""
+	m.streamHead = ""
+}
+
 func (m *Model) finish(e event) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+
+	// 任务被中断时不会再有 OnAssistant，活块就停在半截——
+	// 保留已经流出来的内容（那是真实发生过的），只是不再当它是"活的"。
+	m.closeStream()
+	m.reasoningChars = 0
 
 	if m.pendingCall != "" {
 		pending := m.pendingCall
@@ -695,7 +834,9 @@ func (m *Model) startTask(text string) (tea.Model, tea.Cmd) {
 	m.queued = ""
 	m.slashActive = false
 	m.assistantOpen = false // 新的一轮：重新允许打 "◆ arkperf" 头部
-	m.sel = selection{}     // 提交后清掉选区，免得高亮留在旧内容上
+	m.closeStream()         // 上一轮若有没定稿的流式块，先收尾
+	m.reasoningChars = 0
+	m.sel = selection{} // 提交后清掉选区，免得高亮留在旧内容上
 
 	// 轮次之间空一行：长对话里没有空行，上一轮到哪儿结束根本看不出来
 	lines := []string{}
@@ -721,12 +862,25 @@ func (m *Model) handleApprovalKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	var granted bool
+	decision := kernel.ApprovalDeny
 	switch k {
 	case "y", "Y", "enter":
-		granted = true
+		decision = kernel.ApprovalOnce
+	case "A", "shift+a":
+		// **只认大写 A**，不认小写：审批卡是模态的，而"随手敲了一句话"里
+		// 出现小写 a 太常见了——把它绑成"以后都不问"，等于让一次手滑
+		// 永久放行一类调用。创建持久规则比单次放行重，要求一个显式 Shift 是相称的。
+		//
+		// 只有这个调用有可记忆的类别时才允许。没有类别却按了 A：退化成
+		// "仅这次"，并在下面说清楚——静默退化却让用户以为已经一劳永逸是最糟的。
+		if m.pending.scope != "" {
+			decision = kernel.ApprovalAlways
+		} else {
+			decision = kernel.ApprovalOnce
+			m.approvalNote = "这一次没有可记忆的类别（这类调用每次都不一样），只放行了本次"
+		}
 	case "n", "N", "esc", "ctrl+c":
-		granted = false
+		decision = kernel.ApprovalDeny
 	default:
 		return m, nil // 其他键忽略，审批必须先回答
 	}
@@ -737,15 +891,23 @@ func (m *Model) handleApprovalKey(k string) (tea.Model, tea.Cmd) {
 	m.input.Focus()
 	// 非阻塞投递：后台线程一定在等这个 reply
 	select {
-	case p.reply <- granted:
+	case p.reply <- decision:
 	default:
 	}
 
 	label := "已批准"
-	if !granted {
+	switch decision {
+	case kernel.ApprovalDeny:
 		label = "已拒绝"
+	case kernel.ApprovalAlways:
+		label = "已批准，这一类以后不再询问"
 	}
-	return m, m.print(styleDim.Render("〔审批〕" + label + " · " + p.name))
+	lines := []string{styleDim.Render("〔审批〕" + label + " · " + p.name)}
+	if m.approvalNote != "" {
+		lines = append(lines, styleWarn.Render("〔审批〕"+m.approvalNote))
+		m.approvalNote = ""
+	}
+	return m, m.print(strings.Join(lines, "\n"))
 }
 
 // ---------------------------------------------------------------- 底部区域渲染
@@ -764,6 +926,11 @@ func (m *Model) workingLine(w int) string {
 	// 旋转指示放在输入框上方（Claude Code 同款）：进度在输入区上面，
 	// 快捷键与统计在下面，输入框本身位置固定，不会因为状态变化而跳动。
 	parts := []string{m.spinner.View() + " " + styleDim.Render("运行中")}
+	if m.reasoningChars > 0 {
+		// 思考过程不进转录，但"它在想"必须可见——否则流式刚开始的那几秒
+		// 屏幕看起来像卡住了，而模型其实正在长篇推理。
+		parts = append(parts, styleDim.Render(fmt.Sprintf("思考中 %d 字", m.reasoningChars)))
+	}
 	if m.turns > 0 || m.toolUses > 0 {
 		parts = append(parts, styleDim.Render(fmt.Sprintf("第 %d 轮 · %d 次工具调用", m.turns, m.toolUses)))
 	}
@@ -783,9 +950,21 @@ func (m *Model) approvalCard(w int) string {
 		styleWarn.Bold(true).Render("需要批准") + styleDim.Render("　工具即将执行，可能改变工程或设备状态"),
 		"",
 		styleAccent.Render(m.pending.name) + " " + styleDim.Render(compact(m.pending.args)),
-		"",
-		styleOK.Render("y") + styleDim.Render(" 允许　") + styleErr.Render("n") + styleDim.Render(" 拒绝"),
 	}
+	// 把"这一类"原样显示出来。只给工具名的话，用户会把"以后都不问"
+	// 理解成"永远允许这个工具"，而实际范围可能只是某个目录或某个子命令。
+	if m.pending.scope != "" {
+		lines = append(lines,
+			styleDim.Render("类别："+m.pending.scope),
+			"")
+	}
+	keys := styleOK.Render("y") + styleDim.Render(" 允许一次　")
+	if m.pending.scope != "" {
+		keys += styleWarn.Render("A") + styleDim.Render(" 这一类以后都不问（Shift+a，避免手滑）　")
+	}
+	keys += styleErr.Render("n") + styleDim.Render(" 拒绝")
+	lines = append(lines, keys)
+
 	for i, l := range lines {
 		lines[i] = wrapText(l, inner)
 	}

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+
+	"github.com/fan-weibo/ArkPerf/internal/skill"
 )
 
 // SystemPrompt 组装系统提示词。
@@ -11,7 +13,10 @@ import (
 // 宿主事实（系统、工作目录）显式注入，不靠模型猜：实测模型对运行环境的
 // 先验经常是错的——在 Windows 上习惯性写 Unix 管道，撞墙后反复重试。
 // 把"我在哪、不能做什么"写在最前面，比事后纠错便宜得多。
-func SystemPrompt(cwd string, tools []ToolSpec) string {
+//
+// skills 只贡献名字、描述与路径（见 skill.RenderBlock）——正文由模型
+// 判定相关后自己用 read_file 读，不进这里。没有技能时那一节整个不出现。
+func SystemPrompt(cwd string, tools []ToolSpec, skills []skill.Skill) string {
 	var sb strings.Builder
 
 	sb.WriteString("你是 ArkPerf（方舟智诊），一个面向 OpenHarmony 应用性能体验分析与优化的 Agent。\n")
@@ -43,6 +48,8 @@ func SystemPrompt(cwd string, tools []ToolSpec) string {
 		fmt.Fprintf(&sb, "\n当前可用工具（%d 个，参数见 tools 定义）：%s\n",
 			len(names), strings.Join(names, ", "))
 	}
+
+	sb.WriteString(skill.RenderBlock(skills))
 
 	return sb.String()
 }

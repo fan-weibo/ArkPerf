@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/fan-weibo/ArkPerf/internal/skill"
 )
 
 // ChatFunc 是可注入的模型调用。生产传 Client.Chat，测试传假实现——
@@ -13,17 +15,36 @@ import (
 type ChatFunc func(ctx context.Context, req ChatRequest) (ChatResponse, error)
 
 // Approver 决定一个需要审批的工具能否执行。
+//
+// scope 是这个调用的"类别"（可能为空，表示不可记忆）。前端应当把 scope
+// 显示出来并提供"这一类以后别再问"的选项——**用户必须清楚自己到底
+// 放行了多大范围**，只显示工具名会让"总是允许"看起来像"永远允许这个工具"。
 type Approver interface {
-	Ask(ctx context.Context, name string, args map[string]any) (bool, error)
+	Ask(ctx context.Context, name string, args map[string]any, scope string) (ApprovalDecision, error)
 }
 
 // LoopEvents 是循环对外的事件回调，前端靠它渲染进度。
 // 全部可空：没人监听时循环照跑。
 type LoopEvents struct {
-	OnAssistant  func(text string)
+	OnAssistant func(text string)
+	// OnDelta 是流式增量。设了它就要求模型走流式；不设就是"等说完再给整段"。
+	//
+	// 两种回调的分工必须说清楚，否则前端会打两遍字：
+	//   - OnDelta 负责"边产边显"，同一段文字可能被拆成几十次回调；
+	//   - OnAssistant 仍然是**完整文本**，在每轮结束时调用一次，
+	//     可以当成"把刚才流出来的那段定稿"的通知。
+	//
+	// 于是只看 OnAssistant 的前端（桌面端、一次性执行）行为完全不变，
+	// 而要看增量的前端以 OnAssistant 的文本为准收尾。
+	OnDelta      func(kind DeltaKind, text string)
 	OnToolCall   func(name string, args map[string]any)
 	OnToolResult func(name, output string, isError bool)
 	OnApproval   func(name string, granted bool)
+	// OnApprovalRule 在一次调用命中已保存的规则、或刚记住一条规则时调用。
+	//
+	// 有这个回调是为了**不让放行变成静默的**：用户看到工具直接跑了却没被问，
+	// 唯一能解释的就是这一句"按已保存的规则放行"。
+	OnApprovalRule func(note ApprovalRuleNote)
 }
 
 // StopReason 说明循环为什么停下。区分这些原因是可观测性的基础：
@@ -73,6 +94,12 @@ type LoopConfig struct {
 	// 这样"多轮对话"和"单轮任务"是同一条代码路径，没有第二套实现。
 	History []Message
 
+	// Skills 是本轮可用的技能（按工作目录解析，见 internal/skill）。
+	//
+	// 只有名字、描述与路径进系统提示词，正文由模型自己用 read_file 读。
+	// 为空表示本轮没有技能，系统提示词里连那一节都不出现。
+	Skills []skill.Skill
+
 	// MaxTurns 是轮次上限（一轮 = 一次模型请求 + 它要调的工具）。
 	// 零值用 defaultMaxTurns。这是防死循环烧钱的阀门。
 	MaxTurns int
@@ -83,6 +110,11 @@ type LoopConfig struct {
 	Approval string
 	// Approver 为空时，需要审批的工具一律驳回——安全缺省是拒绝，不是放行。
 	Approver Approver
+	// Rules 是"以后别再问"的记忆。为空表示不做记忆（每次都问）。
+	//
+	// 它**只减少询问次数，不放宽任何红线**：硬拒（guard.go）在工具内部执行，
+	// 与审批是两回事，规则命中与否都拦得住。
+	Rules *ApprovalRules
 
 	Events LoopEvents
 }
@@ -105,7 +137,7 @@ func RunLoop(ctx context.Context, cfg LoopConfig, task string) (res LoopResult, 
 	specs := cfg.Registry.Specs()
 
 	msgs := make([]Message, 0, len(cfg.History)+2)
-	msgs = append(msgs, Message{Role: "system", Content: SystemPrompt(cfg.Ctx.CWD, specs)})
+	msgs = append(msgs, Message{Role: "system", Content: SystemPrompt(cfg.Ctx.CWD, specs, cfg.Skills)})
 	// 历史接在 system 之后、本轮用户输入之前
 	msgs = append(msgs, cfg.History...)
 	msgs = append(msgs, Message{Role: "user", Content: task})
@@ -124,7 +156,10 @@ func RunLoop(ctx context.Context, cfg LoopConfig, task string) (res LoopResult, 
 			return res, nil
 		}
 
-		resp, err := cfg.Chat(ctx, ChatRequest{Messages: msgs, Tools: specs})
+		// OnDelta 直接透传：它为空就表示"不要流式"，provider 会走一次性路径。
+		// 不在这一层做任何包装，是为了让"流式 / 非流式"只由前端要不要增量决定，
+		// 中间任何一层都没机会偷偷改变这个选择。
+		resp, err := cfg.Chat(ctx, ChatRequest{Messages: msgs, Tools: specs, OnDelta: cfg.Events.OnDelta})
 		if err != nil {
 			// 中断引发的失败不是故障，按 interrupted 正常收尾。
 			if ctx.Err() != nil {
@@ -197,15 +232,39 @@ func runOneTool(ctx context.Context, cfg LoopConfig, call ToolCall) ToolResult {
 	}
 
 	if tool.NeedsApproval(args) && cfg.Approval != "auto" {
-		granted, err := askApproval(ctx, cfg, name, args)
-		if cfg.Events.OnApproval != nil {
-			cfg.Events.OnApproval(name, granted)
-		}
-		switch {
-		case err != nil:
-			return fail(fmt.Sprintf("%s: approval failed: %v", name, err))
-		case !granted:
-			return fail(fmt.Sprintf("the user denied running %s; do not retry it, ask the user how to proceed", name))
+		scope := ApprovalScope(tool, args, cfg.Ctx.CWD)
+
+		// 先看有没有"以后别再问"的记忆。命中就不问，但**必须说出来**——
+		// 静默放行会让"这次为什么没问我"变成一个查不出来的问题。
+		if cfg.Rules.Allowed(name, scope) {
+			if cfg.Events.OnApprovalRule != nil {
+				cfg.Events.OnApprovalRule(ApprovalRuleNote{Name: name, Scope: scope, Hit: true})
+			}
+		} else {
+			decision, askErr := askApproval(ctx, cfg, name, args, scope)
+			if cfg.Events.OnApproval != nil {
+				cfg.Events.OnApproval(name, decision.Granted())
+			}
+			switch {
+			case askErr != nil:
+				return fail(fmt.Sprintf("%s: approval failed: %v", name, askErr))
+			case !decision.Granted():
+				return fail(fmt.Sprintf("the user denied running %s; do not retry it, ask the user how to proceed", name))
+			case decision == ApprovalAlways && scope != "":
+				// 记不住只是少了个便利，不该让这次调用失败——但要让用户知道，
+				// 否则他以为已经生效，下次却被再问一遍。
+				// 注意 scope 为空时"总是允许"退化成"仅这次"，这里刻意不提示：
+				// 那是"这个调用本来就没有可记忆的类别"，不是失败。
+				err := cfg.Rules.Remember(name, scope)
+				if cfg.Events.OnApprovalRule != nil {
+					cfg.Events.OnApprovalRule(ApprovalRuleNote{
+						Name:  name,
+						Scope: scope,
+						Saved: err == nil,
+						Err:   err,
+					})
+				}
+			}
 		}
 	}
 
@@ -220,12 +279,12 @@ func runOneTool(ctx context.Context, cfg LoopConfig, call ToolCall) ToolResult {
 	return result
 }
 
-// askApproval 在没有审批通道时返回 false：安全缺省必须是拒绝。
-func askApproval(ctx context.Context, cfg LoopConfig, name string, args map[string]any) (bool, error) {
+// askApproval 在没有审批通道时返回拒绝：安全缺省必须是拒绝。
+func askApproval(ctx context.Context, cfg LoopConfig, name string, args map[string]any, scope string) (ApprovalDecision, error) {
 	if cfg.Approver == nil {
-		return false, nil
+		return ApprovalDeny, nil
 	}
-	return cfg.Approver.Ask(ctx, name, args)
+	return cfg.Approver.Ask(ctx, name, args, scope)
 }
 
 // parseArgs 解析模型给的参数。空字符串按空对象处理（无参工具很常见）。

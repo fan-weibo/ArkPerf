@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import type { WorkspaceChoice } from "../../bindings/github.com/fan-weibo/ArkPerf/desktop";
+import { ref, computed, onMounted, onUnmounted } from "vue";
+import { Service, type WorkspaceChoice, type SessionInfo } from "../../bindings/github.com/fan-weibo/ArkPerf/desktop";
 
-defineProps<{
+const props = defineProps<{
   // 工作区树：每个工作区带着它自己的会话（不是只列当前工作区——
   // 那样切走之后别的项目就看不见、也点不回去了）
   workspaces: WorkspaceChoice[];
@@ -16,12 +16,15 @@ defineProps<{
   active: string;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   (e: "open-session", id: string): void;
   (e: "new-session"): void;
   (e: "tools"): void;
   (e: "toolchain"): void;
   (e: "devices"): void;
+  // 侧栏自己的动作（重命名/移除/打开文件夹）失败时往上抛，
+  // 由主界面打进转录——侧栏没有地方显示错误
+  (e: "error", msg: string): void;
 }>();
 
 // 展开状态：**默认全部展开**，各工作区互不影响。
@@ -44,6 +47,129 @@ function toggle(w: WorkspaceChoice) {
 
 function sessionCount(w: WorkspaceChoice): number {
   return (w.Sessions ?? []).length;
+}
+
+// 会话数为 0 的工作区不进树。
+//
+// 树里的工作区**来自会话历史**：一条会话都没有的工作区没有任何可点的东西，
+// 挂在上面只是噪声（用户明确要求去掉）。当前工作区在下面的输入卡里本来就看得见，
+// 发出第一条消息、产生第一条会话后自然出现在树里。
+//
+// 数据层不滤：底部输入卡的工作区选择器仍然要显示"你现在在哪"（带勾选标记），
+// 那个入口有意义，两个界面各取所需。
+const visibleWorkspaces = computed(() =>
+  props.workspaces.filter((w) => (w.Sessions ?? []).length > 0),
+);
+
+// ---------------------------------------------------------------- 会话右键菜单
+
+// menu 定位用 fixed + 视口内钳制：右键发生在列表深处时，
+// 不钳制的话菜单会伸出窗口外（列表本身可滚动，坐标是相对视口的）。
+const menu = ref<{ x: number; y: number; s: SessionInfo } | null>(null);
+// 移除是破坏性的：先在菜单里就地确认，而不是直接删。
+// 不用系统对话框——它要把用户拽离当前视线，而"确认一个刚点开的菜单"不需要那么重。
+const confirming = ref(false);
+// 重命名用**行内输入**而不是弹框：改的就是眼前这行字，就地改最直观
+const editing = ref<{ id: string; value: string } | null>(null);
+const busy = ref(false);
+
+function fmtErr(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function onSessionContext(e: MouseEvent, s: SessionInfo) {
+  const W = 196, H = 128;
+  menu.value = {
+    x: Math.min(e.clientX, window.innerWidth - W - 8),
+    y: Math.min(e.clientY, window.innerHeight - H - 8),
+    s,
+  };
+  confirming.value = false;
+}
+
+function closeMenu() {
+  menu.value = null;
+  confirming.value = false;
+}
+
+// 点击菜单以外的地方就关。菜单容器上会 @mousedown.stop，
+// 所以能落到 document 的 mousedown 一定发生在菜单之外。
+function onDocMouseDown(e: MouseEvent) {
+  if (menu.value) closeMenu();
+}
+
+function onDocKey(e: KeyboardEvent) {
+  if (e.key === "Escape") {
+    closeMenu();
+    cancelRename();
+  }
+}
+
+onMounted(() => {
+  document.addEventListener("mousedown", onDocMouseDown);
+  document.addEventListener("keydown", onDocKey);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("mousedown", onDocMouseDown);
+  document.removeEventListener("keydown", onDocKey);
+});
+
+// 打开文件夹：这是用户自己点的，不是模型发起的动作，所以不走审批。
+function openFolder() {
+  const m = menu.value;
+  if (!m) return;
+  const cwd = m.s.CWD;
+  closeMenu();
+  Service.OpenFolder(cwd).catch((e) => emit("error", fmtErr(e)));
+}
+
+function startRename() {
+  const m = menu.value;
+  if (!m) return;
+  editing.value = { id: m.s.ID, value: m.s.Title };
+  closeMenu();
+}
+
+// 失焦也提交（和"输入完点别处"的直觉一致）；Enter 提交、Esc 取消。
+async function commitRename() {
+  const ed = editing.value;
+  if (!ed || busy.value) return;
+  busy.value = true;
+  try {
+    await Service.RenameSession(ed.id, ed.value.trim());
+    editing.value = null;
+  } catch (e) {
+    emit("error", fmtErr(e));
+  } finally {
+    busy.value = false;
+  }
+}
+
+function cancelRename() {
+  editing.value = null;
+}
+
+async function doRemove() {
+  const m = menu.value;
+  if (!m || busy.value) return;
+  busy.value = true;
+  try {
+    await Service.DeleteSession(m.s.ID);
+    closeMenu();
+  } catch (e) {
+    emit("error", fmtErr(e));
+  } finally {
+    busy.value = false;
+  }
+}
+
+// 重命名的输入框挂载即聚焦并全选：改的就是眼前这行字，直接打字就能覆盖
+function focusRename(el: unknown) {
+  if (el instanceof HTMLInputElement) {
+    el.focus();
+    el.select();
+  }
 }
 </script>
 
@@ -102,9 +228,12 @@ function sessionCount(w: WorkspaceChoice): number {
       <span v-if="tcTotal > 0 && tcFound < tcTotal" class="status-hint">有缺失</span>
     </button>
 
-    <div class="sect">工作区（{{ workspaces.length }}）</div>
+    <div class="sect">工作区（{{ visibleWorkspaces.length }}）</div>
     <div class="tree">
-      <template v-for="w in workspaces" :key="w.Path">
+      <div v-if="visibleWorkspaces.length === 0" class="tree-empty">
+        还没有工作区。发第一条消息后，这个目录就会出现在这里。
+      </div>
+      <template v-for="w in visibleWorkspaces" :key="w.Path">
         <!-- 整行只做展开/收起，不切工作区 -->
         <button
           class="ws-head"
@@ -123,25 +252,66 @@ function sessionCount(w: WorkspaceChoice): number {
         </button>
 
         <div v-if="isOpen(w)" class="ws-sessions">
-          <button
-            v-for="s in w.Sessions ?? []"
-            :key="s.ID"
-            class="sess"
-            :class="{ cur: s.Current }"
-            :disabled="running"
-            :title="s.CWD"
-            @click="$emit('open-session', s.ID)"
-          >
-            <span class="stitle">{{ s.Title }}</span>
-            <span class="smeta">
-              <span class="stag" v-if="s.Current">会话</span>
-              <span class="sdate">{{ s.Updated }}</span>
-            </span>
-          </button>
+          <template v-for="s in w.Sessions ?? []" :key="s.ID">
+            <!-- 重命名中：用输入框替代整行（input 套在 button 里是非法 HTML） -->
+            <input
+              v-if="editing && editing.id === s.ID"
+              :ref="focusRename"
+              v-model="editing.value"
+              class="sess rename"
+              :disabled="busy"
+              @keydown.enter.prevent="commitRename"
+              @keydown.esc.prevent="cancelRename"
+              @blur="commitRename"
+            />
+            <button
+              v-else
+              class="sess"
+              :class="{ cur: s.Current }"
+              :disabled="running"
+              :title="s.CWD"
+              @click="$emit('open-session', s.ID)"
+              @contextmenu.prevent="onSessionContext($event, s)"
+            >
+              <span class="stitle">{{ s.Title }}</span>
+              <span class="smeta">
+                <span class="stag" v-if="s.Current">会话</span>
+                <span class="sdate">{{ s.Updated }}</span>
+              </span>
+            </button>
+          </template>
           <div v-if="sessionCount(w) === 0" class="none">（还没有会话）</div>
         </div>
       </template>
     </div>
+
+    <!-- 右键菜单。Teleport 到 body：列表可滚动、父级有 overflow 裁剪，
+         原地渲染会被裁掉或跟着滚动跑。 -->
+    <Teleport to="body">
+      <div v-if="menu" class="ctx-backdrop" @mousedown="closeMenu" @contextmenu.prevent="closeMenu">
+        <div class="ctx" :style="{ left: menu.x + 'px', top: menu.y + 'px' }" @mousedown.stop>
+          <template v-if="!confirming">
+            <button class="ctx-item" @click="openFolder">
+              <span class="cico">📁</span>打开文件夹
+            </button>
+            <button class="ctx-item" @click="startRename">
+              <span class="cico">✏️</span>重命名
+            </button>
+            <button class="ctx-item danger" @click="confirming = true">
+              <span class="cico">🗑</span>从列表中移除
+            </button>
+          </template>
+          <template v-else>
+            <div class="ctx-confirm">
+              移除「{{ menu.s.Title }}」？
+              <span>只删对话记录，文件夹里的文件不受影响</span>
+            </div>
+            <button class="ctx-item danger" :disabled="busy" @click="doRemove">移除</button>
+            <button class="ctx-item" @click="closeMenu">取消</button>
+          </template>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -212,6 +382,11 @@ function sessionCount(w: WorkspaceChoice): number {
 
 /* ---- 工作区树 ---- */
 .tree { flex: 1; min-height: 0; overflow-y: auto; }
+.tree-empty {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  padding: 6px 8px;
+}
 
 .ws-head {
   display: flex;
@@ -327,4 +502,62 @@ function sessionCount(w: WorkspaceChoice): number {
 .dot.unknown { background: var(--fg-faint); }
 .status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-hint { flex: none; color: var(--warn); }
+
+/* ---- 会话右键菜单 ---- */
+.rename {
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--fg);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-row);
+  outline: none;
+  margin: 0 0 0 12px;
+  padding: 4px 8px;
+  width: calc(100% - 24px);
+}
+.rename:disabled { opacity: 0.6; }
+
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+.ctx {
+  position: fixed;
+  min-width: 188px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-card);
+}
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  text-align: left;
+}
+.ctx-item:hover { background: var(--bg-elev-2); }
+.ctx-item.danger { color: var(--err); }
+.ctx-item.danger:hover { background: color-mix(in srgb, var(--err) 12%, transparent); }
+.ctx-item:disabled { opacity: 0.5; cursor: default; }
+.cico { width: 17px; flex: none; opacity: 0.85; font-size: 13px; }
+.ctx-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 9px 9px;
+  font-size: var(--text-sm);
+  color: var(--fg);
+}
+.ctx-confirm span { font-size: 11px; color: var(--fg-faint); }
 </style>

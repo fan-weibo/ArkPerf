@@ -6,6 +6,7 @@ import { Events } from "@wailsio/runtime";
 import {
   Service,
   type BootstrapInfo,
+  type MsgLine,
   type ToolInfo,
   type WorkspaceChoice,
 } from "../bindings/github.com/fan-weibo/ArkPerf/desktop";
@@ -18,11 +19,107 @@ import WorkspaceBar from "./components/WorkspaceBar.vue";
 // summary 显示首行，展开显示全文（模板和类型必须对齐，否则 TS 报错）。
 type Line =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
+  | { kind: "assistant"; text: string; head?: boolean }
   | { kind: "tool"; text: string; name: string }
   | { kind: "result"; text: string; name: string; isErr: boolean }
   | { kind: "note"; text: string }
-  | { kind: "error"; text: string };
+  | { kind: "error"; text: string }
+  | { kind: "toolgroup"; key: number; items: ToolEntry[] };
+
+// 一次工具调用 = 参数行 +（可能有）结果行。
+// 单行仍各自可折叠；整块再包一层组折叠头（学 Reasonix）。
+type ToolEntry = {
+  name: string;
+  args: string;
+  result?: { content: string; isErr: boolean };
+};
+
+// 运行中手动干预过的组（key = 组首行在 lines 里的下标，追加式增长时稳定）。
+// 存的是**显式开/关**而不是"是否展开"：默认开合随运行状态走，
+// 用户点了就以用户为准——否则运行中点收起会被"最后一组默认展开"顶回去。
+const groupOverride = ref<Record<number, boolean>>({});
+
+function toggleGroup(key: number) {
+  groupOverride.value = { ...groupOverride.value, [key]: !groupOpen(key) };
+}
+
+// 「方舟智诊」标签在**渲染时**推导，不靠数据里传标志位。
+//
+// 规则：每条 user 消息（= 一次任务）之后的第一段回答挂标签。
+// 之前试过让后端在数据里带 head 标志——实时与回放两条路径都要各自维护，
+// 结果回放路径把它弄丢了（实测：实时有一个标签，切会话回来一个都没有）。
+// 推导只需要行的顺序，谁产生这些行都无所谓，天然对两条路径一致。
+const renderedLines = computed<Line[]>(() => {
+  let needHead = true;
+  const out: Line[] = [];
+  // 连续的 tool/result 行聚成一个可折叠组。组首行下标作 key：
+  // lines 是追加式的，中途不会变动前面的行，key 因此稳定。
+  let buf: ToolEntry[] = [];
+  let bufKey = -1;
+  const flush = () => {
+    if (!buf.length) return;
+    out.push({ kind: "toolgroup", key: bufKey, items: buf });
+    buf = [];
+    bufKey = -1;
+  };
+
+  lines.value.forEach((l, idx) => {
+    if (l.kind === "tool") {
+      if (bufKey < 0) bufKey = idx;
+      buf.push({ name: l.name, args: l.text });
+      return;
+    }
+    if (l.kind === "result") {
+      if (bufKey < 0) bufKey = idx;
+      const last = buf[buf.length - 1];
+      if (last && !last.result) {
+        last.result = { content: l.text, isErr: l.isErr };
+      } else {
+        // 结果比调用多（理论不该发生）：如实显示，不吞掉
+        buf.push({ name: l.name, args: "", result: { content: l.text, isErr: l.isErr } });
+      }
+      return;
+    }
+    flush();
+    if (l.kind === "user") {
+      needHead = true; // 新的一次任务
+      out.push(l);
+      return;
+    }
+    if (l.kind === "assistant") {
+      if (needHead) {
+        needHead = false;
+        out.push({ ...l, head: true } as Line);
+      } else {
+        out.push(l);
+      }
+      return;
+    }
+    out.push(l); // note / error 不影响分组与标签
+  });
+  flush();
+  return out;
+});
+
+// 组的默认开合：**运行中**最后一组展开（要看得到实时进度），
+// 任务结束自动收起（转录恢复干净）；用户点开过的保持展开。
+const lastGroupKey = computed(() => {
+  for (let i = renderedLines.value.length - 1; i >= 0; i--) {
+    const l = renderedLines.value[i];
+    if (l.kind === "toolgroup") return l.key;
+  }
+  return -1;
+});
+
+function groupOpen(key: number): boolean {
+  const o = groupOverride.value[key];
+  if (o !== undefined) return o; // 用户点过：以用户为准
+  return running.value && key === lastGroupKey.value;
+}
+
+function failedCount(items: ToolEntry[]): number {
+  return items.filter((x) => x.result?.isErr).length;
+}
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -40,8 +137,22 @@ const toolsLoaded = ref(false);
 const task = ref("");
 const running = ref(false);
 const toolCalls = ref(0);
-const approval = ref<{ id: string; name: string; args: string } | null>(null);
-const report = ref("");
+const approval = ref<{ id: string; name: string; args: string; scope: string } | null>(null);
+// 流式输出：活块在 lines 里的下标，-1 表示当前没有正在流的块。
+// 与 TUI 同一做法——整块更新而不是每段追加一行：追加会被 markdown 渲染
+// 切得七零八落，定稿时还得回头把碎片收拾干净。
+const streamIdx = ref(-1);
+// 思考过程**不进转录**（往往比回答长一个数量级，全留下来会把结论冲得看不见），
+// 只在运行条上给个字数，让"它在想"可见。
+const thinking = ref(0);
+// 工具链与设备**各自**的报告。
+//
+// 不能共用一个 ref：两个页面都靠起子进程拿数据（探测要跑 5 个工具，
+// 设备要跑 hdc list targets），都是秒级。共用的话，先发的请求后返回
+// 就会把另一个页面正在显示的内容覆盖掉——用户看到"设备列表里出现
+// 工具链报告"，而且时机不定，几乎没法靠观察定位（实测撞过）。
+const tcReport = ref("");
+const dvReport = ref("");
 const streamEl = ref<HTMLElement | null>(null);
 const ta = ref<HTMLTextAreaElement | null>(null);
 
@@ -164,7 +275,40 @@ onMounted(async () => {
   // 先订事件再 Bootstrap：Bootstrap 要读配置、连 MCP，可能耗时几秒，
   // 顺序反了这期间的事件会丢。
   unsubs.push(
+    Events.On("arkperf:delta", (ev) => {
+      // 只渲染可见回答；思考过程只在运行条上给个字数。
+      if (ev.data.Kind === "reasoning") {
+        thinking.value += [...ev.data.Text].length;
+        return;
+      }
+      thinking.value = 0;
+      if (streamIdx.value < 0) {
+        lines.value.push({ kind: "assistant", text: ev.data.Text } as Line);
+        streamIdx.value = lines.value.length - 1;
+      } else {
+        const cur = lines.value[streamIdx.value];
+        if (cur && cur.kind === "assistant") cur.text += ev.data.Text;
+      }
+      toBottom();
+    }),
     Events.On("arkperf:assistant", (ev) => {
+      // 流式已经把它显示出来了：这里以**完整文本**为准定稿，不再追加一行。
+      // 增量与完整文本有出入时以完整文本为准，否则屏幕上留下的
+      // 会和下一轮上下文里的不一样。
+      const idx = streamIdx.value;
+      streamIdx.value = -1;
+      if (idx >= 0) {
+        const cur = lines.value[idx];
+        if (cur && cur.kind === "assistant") {
+          if (!ev.data.trim()) {
+            lines.value.splice(idx, 1); // 流出来又变空：整块撤掉，别留一行空白
+          } else {
+            cur.text = ev.data;
+          }
+          toBottom();
+          return;
+        }
+      }
       push("assistant", ev.data);
     }),
     Events.On("arkperf:toolcall", (ev) => {
@@ -178,7 +322,28 @@ onMounted(async () => {
       }),
     ),
     Events.On("arkperf:approval:request", (ev) => {
-      approval.value = { id: ev.data.ID, name: ev.data.Name, args: ev.data.Args };
+      approval.value = {
+        id: ev.data.ID,
+        name: ev.data.Name,
+        args: ev.data.Args,
+        scope: ev.data.Scope ?? "",
+      };
+    }),
+    // 三种情况都要说出来——尤其是"命中规则"：用户看到工具直接跑了却没被问，
+    // 唯一能解释它的就是这一条。
+    Events.On("arkperf:approval:rule", (ev) => {
+      const d = ev.data;
+      if (d.Err) {
+        push("note", `规则没能保存（${d.Err}）——这次已放行，但下次还会问你`);
+        return;
+      }
+      if (d.Saved) {
+        push("note", `已记住：${d.Name} 的「${d.Scope}」以后不再询问`);
+        return;
+      }
+      if (d.Hit) {
+        push("note", `按已保存的规则放行 ${d.Name}（${d.Scope}）`);
+      }
     }),
     Events.On("arkperf:approval:resolved", (ev) =>
       push("note", `${ev.data.Granted ? "已批准" : "已拒绝"}：${ev.data.Name}`),
@@ -186,11 +351,23 @@ onMounted(async () => {
     Events.On("arkperf:done", (ev) => {
       running.value = false;
       approval.value = null;
+      streamIdx.value = -1; // 中断时不会有定稿事件，活块就地收掉（已流出的内容保留）
+      thinking.value = 0;
       if (ev.data.Err) {
         push("error", `任务失败：${ev.data.Err}`);
       } else {
         push("note", `结束：${ev.data.Reason} · ${ev.data.Turns} 轮 · ${ev.data.ToolUses} 次工具调用`);
       }
+      // 任务跑完必须整块刷新：这一轮结束时后端已经把会话落盘了——
+      // 在新工作区里的第一次任务会让那个工作区**第一次**出现在侧栏里。
+      // 不刷新的话，侧栏停在任务开始前的那份，新工作区"凭空不见了"
+      // （实测：在新目录发第一条消息，树里没有它，看起来像没保存）。
+      // 模型也可能写过文件，右栏文件树一并刷新。
+      void refreshAll();
+    }),
+    // 侧栏的结构变了（重命名/移除会话）：后端推一份新的树过来，前端不用自己再拉
+    Events.On("arkperf:workspaces", (ev) => {
+      workspaces.value = ev.data ?? [];
     }),
   );
 
@@ -235,6 +412,8 @@ async function run() {
   push("user", text);
   running.value = true;
   toolCalls.value = 0;
+  streamIdx.value = -1; // 新任务不能接着上一轮的活块写
+  thinking.value = 0;
   try {
     await Service.RunTask(text);
   } catch (e) {
@@ -260,12 +439,12 @@ async function interrupt() {
   }
 }
 
-async function answer(allow: boolean) {
+async function answer(decision: "once" | "always" | "deny") {
   const cur = approval.value;
   if (!cur) return;
   approval.value = null;
   try {
-    await Service.AnswerApproval(cur.id, allow);
+    await Service.AnswerApproval(cur.id, decision);
   } catch (e) {
     push("error", fmtErr(e));
   }
@@ -283,9 +462,9 @@ async function loadTools() {
 async function checkToolchain() {
   tcLoading.value = true;
   try {
-    report.value = await Service.CheckToolchain();
+    tcReport.value = await Service.CheckToolchain();
   } catch (e) {
-    report.value = fmtErr(e);
+    tcReport.value = fmtErr(e);
   } finally {
     tcLoading.value = false;
   }
@@ -294,9 +473,9 @@ async function checkToolchain() {
 async function listDevices() {
   dvLoading.value = true;
   try {
-    report.value = await Service.ListDevices();
+    dvReport.value = await Service.ListDevices();
   } catch (e) {
-    report.value = fmtErr(e);
+    dvReport.value = fmtErr(e);
   } finally {
     dvLoading.value = false;
   }
@@ -307,7 +486,8 @@ async function newSession() {
   try {
     await Service.ResetSession();
     lines.value = [];
-    report.value = "";
+    tcReport.value = "";
+    dvReport.value = "";
     push("note", "已开始新会话：模型上下文已清空");
     await refreshAll();
   } catch (e) {
@@ -316,19 +496,27 @@ async function newSession() {
 }
 
 // 切换会话：会连带切换工作区（后端会自动跟随），所以刷新要整块做。
+// 回放的转录行 → 界面行。工具调用也要回放：之前只回放 user/assistant，
+// 结果"切个会话再回来，工具调用全没了"，用户看到的是残缺的对话。
+function replayLines(hist: MsgLine[]): Line[] {
+  return (hist ?? []).map((m) => {
+    if (m.Role === "user") return { kind: "user", text: m.Content } as Line;
+    if (m.Role === "tool") return { kind: "tool", text: m.Content, name: m.Name ?? "" } as Line;
+    if (m.Role === "result")
+      return { kind: "result", text: m.Content, name: m.Name ?? "", isErr: false } as Line;
+    return { kind: "assistant", text: m.Content } as Line;
+  });
+}
+
 async function onSwitch(id: string) {
   // 先切视图再等数据：点了会话就该立刻回到聊天页，
   // 历史转录加载完再填充（漏了这行就会"切了会话却还停在功能页"，实测撞过）
   view.value = "chat";
   try {
     // Go 的 nil slice 在 TS 侧是 null（绑定类型是 MsgLine[] | null），要兜 ?? []
-    const hist = (await Service.SwitchSession(id)) ?? [];
-    lines.value = hist.map((m) =>
-      m.Role === "user"
-        ? ({ kind: "user", text: m.Content } as Line)
-        : ({ kind: "assistant", text: m.Content } as Line),
-    );
-    report.value = "";
+    lines.value = replayLines((await Service.SwitchSession(id)) ?? []);
+    tcReport.value = "";
+    dvReport.value = "";
     stick.value = true;
     await refreshAll();
     toBottom();
@@ -341,13 +529,9 @@ async function onSwitch(id: string) {
 async function onSwitchWorkspace(path: string) {
   view.value = "chat";
   try {
-    const hist = (await Service.SwitchWorkspace(path)) ?? [];
-    lines.value = hist.map((m) =>
-      m.Role === "user"
-        ? ({ kind: "user", text: m.Content } as Line)
-        : ({ kind: "assistant", text: m.Content } as Line),
-    );
-    report.value = "";
+    lines.value = replayLines((await Service.SwitchWorkspace(path)) ?? []);
+    tcReport.value = "";
+    dvReport.value = "";
     stick.value = true;
     await refreshAll();
     toBottom();
@@ -406,6 +590,7 @@ function useExample(t: string) {
         @tools="openView('tools')"
         @toolchain="openView('toolchain')"
         @devices="openView('devices')"
+        @error="push('error', $event)"
       />
     </aside>
     <div class="resizer" @pointerdown="(e) => down(e, 'left')"></div>
@@ -461,37 +646,58 @@ function useExample(t: string) {
 
         <main ref="streamEl" class="stream" @scroll="onScroll">
           <div class="column">
-            <template v-for="(l, i) in lines" :key="i">
+            <template v-for="(l, i) in renderedLines" :key="i">
               <div v-if="l.kind === 'user'" class="node user">
                 <div class="bubble">{{ l.text }}</div>
               </div>
 
               <div v-else-if="l.kind === 'assistant'" class="node assistant">
-                <div class="meta"><span class="adot"></span>方舟智诊</div>
+                <!-- head：一次任务只在第 1 段回答上挂标签 -->
+                <div class="meta" v-if="l.head"><span class="adot"></span>方舟智诊</div>
                 <!-- 模型输出是 markdown；v-html 的内容已经过 DOMPurify 消毒 -->
                 <div class="md" v-html="md(l.text)"></div>
               </div>
 
-              <details v-else-if="l.kind === 'tool'" class="toolrow">
-                <summary>
-                  <span class="tname">{{ l.name }}</span>
-                  <span class="targs">{{ firstLine(l.text) }}</span>
-                </summary>
-                <pre class="tbody">{{ l.text }}</pre>
-              </details>
-
+              <!-- 工具块：整组一个折叠头（学 Reasonix）。运行中最后一组自动展开看进度，
+                   结束后收起；单行仍各自可折叠，两层互不干扰。 -->
               <details
-                v-else-if="l.kind === 'result'"
-                class="toolres"
-                :class="{ iserr: l.isErr }"
-                :open="l.text.length <= 240"
+                v-else-if="l.kind === 'toolgroup'"
+                class="toolgroup"
+                :open="groupOpen(l.key)"
               >
-                <summary>
-                  <span class="mark">{{ l.isErr ? "✗" : "✓" }}</span>
-                  <span class="tname">{{ l.name }}</span>
-                  <span class="targs">{{ firstLine(l.text) }}</span>
+                <summary @click.prevent="toggleGroup(l.key)">
+                  <span class="tgcount">{{ l.items.length }} 次工具调用</span>
+                  <span class="tgfail" v-if="failedCount(l.items)">
+                    {{ failedCount(l.items) }} 次失败
+                  </span>
                 </summary>
-                <pre class="tbody">{{ l.text }}</pre>
+
+                <div class="tgbody">
+                  <template v-for="(it, k) in l.items" :key="k">
+                    <!-- 单行折叠：与原来的行为完全一致，只是被组包起来了 -->
+                    <details class="toolrow">
+                      <summary>
+                        <span class="tname">{{ it.name }}</span>
+                        <span class="targs">{{ firstLine(it.args) }}</span>
+                      </summary>
+                      <pre class="tbody">{{ it.args }}</pre>
+                    </details>
+
+                    <details
+                      v-if="it.result"
+                      class="toolres"
+                      :class="{ iserr: it.result.isErr }"
+                      :open="it.result.content.length <= 240"
+                    >
+                      <summary>
+                        <span class="mark">{{ it.result.isErr ? "✗" : "✓" }}</span>
+                        <span class="tname">{{ it.name }}</span>
+                        <span class="targs">{{ firstLine(it.result.content) }}</span>
+                      </summary>
+                      <pre class="tbody">{{ it.result.content }}</pre>
+                    </details>
+                  </template>
+                </div>
               </details>
 
               <div v-else-if="l.kind === 'note'" class="note">{{ l.text }}</div>
@@ -503,9 +709,13 @@ function useExample(t: string) {
         <section v-if="approval" class="approval">
           <div class="approval-title">需要批准 · {{ approval.name }}</div>
           <div class="approval-args">{{ approval.args }}</div>
+          <!-- 类别必须原样显示：只给工具名的话，用户会把"以后都不问"
+               理解成"永远允许这个工具"，而实际范围可能只是某个目录。 -->
+          <div v-if="approval.scope" class="approval-scope">类别：{{ approval.scope }}</div>
           <div class="approval-actions">
-            <button class="primary" @click="answer(true)">允许</button>
-            <button class="ghost" @click="answer(false)">拒绝</button>
+            <button class="primary" @click="answer('once')">允许一次</button>
+            <button v-if="approval.scope" class="ghost" @click="answer('always')">这一类以后都不问</button>
+            <button class="ghost" @click="answer('deny')">拒绝</button>
           </div>
         </section>
 
@@ -518,6 +728,7 @@ function useExample(t: string) {
             <div v-if="running" class="runstrip">
               <span class="rdot"></span>
               <span>运行中 · 已调用 {{ toolCalls }} 次工具</span>
+              <span v-if="thinking > 0" class="thinkdim">思考中 {{ thinking }} 字</span>
               <button class="linkbtn" @click="interrupt">中断</button>
             </div>
             <textarea
@@ -581,7 +792,7 @@ function useExample(t: string) {
               {{ tcLoading ? "探测中…" : "重新探测" }}
             </button>
           </div>
-          <pre class="page-pre">{{ tcLoading ? "探测中…" : report }}</pre>
+            <pre class="page-pre">{{ tcLoading ? "探测中…" : tcReport }}</pre>
         </div>
       </div>
 
@@ -597,7 +808,7 @@ function useExample(t: string) {
               {{ dvLoading ? "查询中…" : "刷新" }}
             </button>
           </div>
-          <pre class="page-pre">{{ dvLoading ? "查询中…" : report }}</pre>
+            <pre class="page-pre">{{ dvLoading ? "查询中…" : dvReport }}</pre>
         </div>
       </div>
     </main>
@@ -781,6 +992,39 @@ function useExample(t: string) {
 .md :deep(hr) { border: 0; border-top: 1px solid var(--border-soft); margin: 12px 0; }
 
 /* ---- 工具行（可折叠） ---- */
+/* ---- 工具组折叠头 ---- */
+.toolgroup {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-row);
+  background: var(--bg-elev-2);
+  overflow: hidden;
+  min-width: 0;
+}
+.toolgroup > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+}
+.toolgroup > summary::-webkit-details-marker { display: none; }
+.toolgroup > summary::before {
+  content: "▸";
+  color: var(--fg-faint);
+  transition: transform 0.12s;
+  flex: none;
+}
+details[open].toolgroup > summary::before { transform: rotate(90deg); }
+.toolgroup > summary:hover { color: var(--fg); }
+.tgcount { font-variant-numeric: tabular-nums; }
+.tgfail { color: var(--err); font-size: var(--text-xs); }
+/* 组体：比组头缩进一点，视觉上"属于这个组" */
+.tgbody { display: flex; flex-direction: column; gap: 4px; padding: 2px 8px 8px 14px; }
+
+/* ---- 单行折叠（保持原样，只是住进了组里） ---- */
 .toolrow, .toolres {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-row);
@@ -872,7 +1116,14 @@ details[open] > summary::before { transform: rotate(90deg); }
   word-break: break-all;
   opacity: 0.9;
 }
-.approval-actions { display: flex; gap: 8px; }
+/* "这一类"要一眼能和参数区分开：它是用户决定要不要按第三个按钮的依据 */
+.approval-scope {
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+  margin: -4px 0 10px;
+  word-break: break-all;
+}
+.approval-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .approval-actions .primary {
   background: var(--accent);
   color: var(--accent-fg);
@@ -1028,6 +1279,12 @@ textarea::placeholder { color: var(--fg-faint); }
 @keyframes rdot-pulse {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
+}
+/* 思考字数：流式刚开始的那几秒屏幕没有别的变化，得让人知道"它在想" */
+.thinkdim {
+  color: var(--fg-dim);
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
 }
 .linkbtn {
   margin-left: auto;

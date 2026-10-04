@@ -11,6 +11,7 @@
 便于后续 _server.py 薄封装。
 """
 
+import json
 import math
 import os
 import re
@@ -647,6 +648,52 @@ def compare_sessions(baseline: dict, current: dict, alpha: float = 0.05) -> dict
 # ============================================================
 # 三明治判定（ABBA）—— 用两次基线自证环境是否漂移
 # ============================================================
+# ============================================================
+# 基线存取
+#
+# 持久化属于本层：_server.py 只做透传。与 agent_core 自己负责归档报告是同一个口径。
+# 曾一度把这段写在 cold_start_server.py 里，而那个文件的 docstring 同时写着
+# "逻辑全在 cold_start_core.py"——自相矛盾的契约比没有契约更害人。
+# ============================================================
+
+def default_baseline_path() -> str:
+    """默认基线文件位置（与本模块同目录）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "cold_start_baseline.json")
+
+
+def load_baseline(path: str = "") -> dict:
+    """读取基线。
+
+    统一返回 dict，**失败时带 "error" 键而不是抛异常**：
+    "文件在不在""读坏了算什么"是本层该定的规则，不该让 server 层
+    自己写 try/except 去猜。
+    """
+    p = path or default_baseline_path()
+    if not os.path.exists(p):
+        return {"error": f"未找到基线文件：{p}"}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        return {"error": f"基线读取失败（{p}）：{e}"}
+
+
+def save_baseline(result: dict, path: str = "") -> dict:
+    """把一次测量结果存为基线，返回 {"ok":..., "path":...} 或 {"ok":False, "error":...}。
+
+    写盘失败（磁盘满、没权限）必须能报出来——否则界面上写着"基线已保存"，
+    实际什么都没留下，等用户要做对比时才发现基线是空的。
+    """
+    p = path or default_baseline_path()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        return {"ok": False, "error": f"基线写入失败（{p}）：{e}"}
+    return {"ok": True, "path": p}
+
+
 def sandwich_check(base1: dict, new: dict, base2: dict, alpha: float = 0.05) -> dict:
     """三明治法：base1 → 改动 → new → 回滚 → base2。
 

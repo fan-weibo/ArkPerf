@@ -22,6 +22,7 @@ import (
 	"github.com/fan-weibo/ArkPerf/internal/domain/harmony"
 	"github.com/fan-weibo/ArkPerf/internal/kernel"
 	"github.com/fan-weibo/ArkPerf/internal/mcp"
+	"github.com/fan-weibo/ArkPerf/internal/skill"
 	"github.com/fan-weibo/ArkPerf/internal/tools"
 )
 
@@ -49,6 +50,11 @@ func NewRegistry() *kernel.Registry {
 	for _, t := range tools.Exec() {
 		reg.Register(t)
 	}
+	// 搜索（grep / find）：run_command 不经过 shell、没有管道，
+	// 所以搜索必须有专用入口，否则搜大日志只能全读进来
+	for _, t := range tools.Search() {
+		reg.Register(t)
+	}
 	for _, t := range tools.Harmony(Toolchain()) {
 		reg.Register(t)
 	}
@@ -61,6 +67,39 @@ func NewRegistry() *kernel.Registry {
 // 没有任何区别——审批、截断、结果回填全部走同一条路径。
 func AttachMCP(ctx context.Context, cfg *kernel.Config, reg *kernel.Registry) *mcp.Set {
 	return mcp.LoadAll(ctx, reg, mcp.FromConfig(cfg))
+}
+
+// SkillsFor 按工作目录解析可用技能（项目级 > 用户级 > 内置），并返回发现过程中的问题。
+//
+// 每次都重新解析，不做缓存：三层加起来不过十几次目录读取，而任何缓存都要
+// 处理"用户切了工作区""用户刚往 skills/ 里丢了一个新技能"这些失效场景——
+// 缓存失效的表现是"技能时有时无"，比多读几次目录难查得多。
+//
+// 诊断不在这里打印：调用方最清楚该写到哪里（CLI 写 stderr、GUI 弹提示）。
+func SkillsFor(cwd string) ([]skill.Skill, []skill.Diagnostic) {
+	return skill.Discover(cwd, kernel.Home(), skill.ResolveBuiltinDir())
+}
+
+// refreshSkills 按当前 cwd 重建技能集。
+//
+// 调用方要么在构造期（对象还没被共享），要么已经持有 s.mu——本函数自己不加锁，
+// 因为它会被 SetWorkspace 在持锁状态下调用，再加一次就是死锁。
+func (s *Session) refreshSkills() {
+	s.skills, s.skillDiags = SkillsFor(s.cwd)
+}
+
+// WarnSkillDiagnostics 把技能发现的问题打到 stderr。
+//
+// 只打一次（启动时）。技能是外部输入，坏了只跳过、不阻断——但也不能不吭声：
+// 用户最常见的困惑是"我明明把技能放进去了，模型还是不会用"，
+// 而原因（frontmatter 少一行、名字带了大写）不打印出来就完全看不见。
+//
+// 放在 app 而不是各前端，是为了让措辞只有一份：同一句话在三个前端里
+// 各写一遍，迟早会有一处漏掉新加的那类问题。
+func WarnSkillDiagnostics(diags []skill.Diagnostic) {
+	for _, d := range diags {
+		fmt.Fprintf(os.Stderr, "arkperf: 技能已跳过 %s：%s\n", d.Path, d.Message)
+	}
 }
 
 // Options 是打开一次交互式会话的输入。
@@ -99,6 +138,14 @@ type Session struct {
 	conv *kernel.Conversation
 	// restored 是启动时接上的旧会话（nil 表示新建）。
 	restored *kernel.Session
+	// skills 是当前工作目录下的技能集，随 cwd 变化而重建（见 refreshSkills）。
+	skills []skill.Skill
+	// skillDiags 是上次解析技能时记下的问题，供 /skills 与启动提示展示。
+	skillDiags []skill.Diagnostic
+
+	// rules 是"以后别再问"的审批记忆。为 nil 表示不可用（文件读坏了），
+	// 此时行为退化成每次都问——不会放宽任何东西。
+	rules *kernel.ApprovalRules
 }
 
 // Open 读配置、装配工具与 MCP、按工作目录接上最近一段会话。
@@ -154,10 +201,24 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		store:    store,
 		conv:     kernel.NewConversation(),
 	}
+
+	// 审批规则：读坏了既不覆盖、也不假装没有——打出来，并按"每次都问"继续。
+	// 静默当成空规则最危险：下一次 Remember 会把用户原来的规则整份覆盖掉，
+	// 而他完全不知道，只会觉得"我设过的规则怎么没了"。
+	if rules, rulesErr := kernel.LoadApprovalRules(kernel.ApprovalRulesPath()); rulesErr != nil {
+		fmt.Fprintf(os.Stderr, "arkperf: %v（本次按「每次都问」处理）\n", rulesErr)
+	} else {
+		s.rules = rules
+	}
 	if !o.NoMCP {
 		s.mcpSet = AttachMCP(ctx, cfg, s.reg)
 		s.mcpBrief = "MCP " + s.mcpSet.Summary()
 	}
+
+	// 技能按工作目录解析——项目级技能就在工作区的 .arkperf/skills 下，
+	// 所以必须在 cwd 定下来之后才解析。
+	s.refreshSkills()
+	WarnSkillDiagnostics(s.skillDiags)
 
 	// 会话：按工作目录恢复最近一段，恢复不到就新建。
 	// 让"重开界面接着上次说"成为默认行为，而不是需要记住命令的操作。
@@ -215,6 +276,58 @@ func (s *Session) CurrentID() string {
 	return s.sess.ID
 }
 
+// RenameSession 给会话起一个自定义名（侧栏"重命名"）。
+//
+// 名字存在会话文件里而不是单独的索引里：改名跟着会话走，
+// 删掉会话名字自然也没了，不会留下悬空条目。
+// 空串表示清除自定义名（回到"第一条提问"的自动标题）。
+func (s *Session) RenameSession(id, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.store.Load(id)
+	if err != nil {
+		return err
+	}
+	sess.Rename(title)
+	if err := s.store.Save(sess); err != nil {
+		return err
+	}
+	// 改的正是当前会话：内存里这份也要跟上，否则侧栏刷新前
+	// 还显示旧名字，而 Save 会把内存这份（带旧名字）写回去覆盖掉刚才的改名。
+	if s.sess.ID == id {
+		s.sess = sess
+	}
+	return nil
+}
+
+// DeleteSession 删掉一个会话（侧栏"从列表中移除"）。
+//
+// 只删会话记录，不碰它所在的工作目录。删的是**当前正在看的会话**时，
+// 自动切到该目录下最近的一条；一条都没有了就开新会话——
+// 否则界面会停在一个已经不存在的会话上，下一轮任务写不进任何文件。
+func (s *Session) DeleteSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.store.Delete(id); err != nil {
+		return err
+	}
+	if s.sess.ID != id {
+		return nil
+	}
+	// 删的是当前会话：找同目录下最近的替代，找不到就开新的
+	if next := s.store.LatestForCWD(s.cwd); next != nil {
+		s.sess = next
+	} else {
+		s.sess = s.store.New(s.cwd)
+	}
+	s.conv = kernel.NewConversation()
+	s.conv.Restore(s.sess.Messages)
+	s.restored = s.sess
+	return nil
+}
+
 // Transcript 返回当前会话的完整消息列表（切会话后回放用）。
 func (s *Session) Transcript() []kernel.Message {
 	s.mu.Lock()
@@ -260,6 +373,8 @@ func (s *Session) SetWorkspace(dir string) error {
 
 	s.cwd = abs
 	s.conv.Reset()
+	// 技能跟着工作区走：切过去该用那个工程自己的技能，而不是上一个工程的。
+	s.refreshSkills()
 	if prev := s.store.LatestForCWD(abs); prev != nil {
 		s.sess = prev
 		s.restored = prev
@@ -306,12 +421,20 @@ func (s *Session) NewRunner(ap kernel.Approver, ev kernel.LoopEvents) RunFunc {
 		Approver:     ap,
 		Events:       &ev,
 		Conversation: s.conv, // 多轮会话的载体
+		// 技能按次给（见下面的闭包）：工作区会变，取一次固定值会过期
+		Rules: s.rules,
 		// 前端自己渲染事件，Runner 的文本输出丢弃
 		Out: io.Discard,
 	}
 	return func(ctx context.Context, task string) (kernel.LoopResult, error) {
-		// CWD 在每次调用时重新读 s.cwd：用户切了工作区，下一次任务就该用新目录
-		res, err := runner.Run(ctx, kernel.Task{Text: task, MaxTurns: s.maxTurns, CWD: s.cwd})
+		// CWD 与 Skills 都在每次调用时重新读：用户切了工作区，
+		// 下一次任务就该用新目录下的工具基准与技能集。
+		res, err := runner.Run(ctx, kernel.Task{
+			Text:     task,
+			MaxTurns: s.maxTurns,
+			CWD:      s.cwd,
+			Skills:   s.Skills(),
+		})
 		if saveErr := s.Save(); saveErr != nil {
 			fmt.Fprintf(os.Stderr, "arkperf: 会话保存失败: %v\n", saveErr)
 		}
@@ -330,6 +453,9 @@ func (s *Session) Registry() *kernel.Registry { return s.reg }
 // Config 是已校验的配置。
 func (s *Session) Config() *kernel.Config { return s.cfg }
 
+// ApprovalRules 返回已加载的审批规则（文件读坏了时为 nil）。
+func (s *Session) ApprovalRules() *kernel.ApprovalRules { return s.rules }
+
 // ModelName 是当前模型名（展示用）。
 func (s *Session) ModelName() string { return s.cfg.Provider.Model }
 
@@ -344,6 +470,30 @@ func (s *Session) ToolchainCounts() (int, int) {
 
 // MCPSummary 是 MCP 装配摘要，如 "MCP 5/5 · 13 工具"。
 func (s *Session) MCPSummary() string { return s.mcpBrief }
+
+// Skills 返回当前工作目录下的技能集。
+//
+// 返回副本：调用方（前端渲染、报告）拿到之后会按自己的节奏用，
+// 传出去的可变切片被改坏会影响到下一轮提示词。
+func (s *Session) Skills() []skill.Skill {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]skill.Skill(nil), s.skills...)
+}
+
+// SkillDiagnostics 返回上次解析技能时记下的问题。
+func (s *Session) SkillDiagnostics() []skill.Diagnostic {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]skill.Diagnostic(nil), s.skillDiags...)
+}
+
+// SkillSummary 是当前会话的技能摘要。
+func (s *Session) SkillSummary() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return SkillSummary(s.skills)
+}
 
 // AutoApprove 表示是否需要审批的工具直接执行。
 func (s *Session) AutoApprove() bool { return s.auto }
@@ -401,6 +551,89 @@ func ToolchainReport(ctx context.Context) (string, error) {
 		fmt.Fprintf(&sb, "SDK 目录：%s（构建时会自动补 DEVECO_SDK_HOME）\n", tc.SDKDir)
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// SkillReport 生成技能清单报告，供命令行 `arkperf skills` 与各前端共用。
+//
+// 与 ToolchainReport 同一个理由：命令行与界面各写一份，迟早出现
+// "命令行说 3 个、界面说 2 个"这种分裂。
+//
+// 把**路径**打出来是刻意的：同名技能会被高优先级盖掉，用户看到路径
+// 才能确认"我改的那一份到底生效了没有"，否则只能靠猜。
+func SkillReport(cwd string) string {
+	skills, diags := SkillsFor(cwd)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "技能目录（按优先级）：\n")
+	for _, r := range skill.Roots(cwd, kernel.Home(), skill.ResolveBuiltinDir()) {
+		fmt.Fprintf(&sb, "  [%s] %s\n", r.Source, r.Dir)
+	}
+	fmt.Fprintf(&sb, "\n%s\n", SkillSummary(skills))
+
+	if len(skills) > 0 {
+		sb.WriteString("\n")
+		for _, s := range skills {
+			fmt.Fprintf(&sb, "%-24s [%s] %s\n", s.Name, s.Source, oneLineDesc(s.Description))
+			fmt.Fprintf(&sb, "%-24s        %s\n", "", s.FilePath)
+		}
+	}
+
+	if len(diags) > 0 {
+		sb.WriteString("\n已跳过（不影响其他技能）：\n")
+		for _, d := range diags {
+			fmt.Fprintf(&sb, "  %s\n    %s\n", d.Path, d.Message)
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// SkillSummary 生成一行技能摘要，如 "技能 3 个 · 项目 1 用户 0 内置 2"。
+//
+// 同时供会话视图（Session.SkillSummary）与无会话场景（一次性执行、
+// 报告）使用，避免两处各写一份而慢慢分叉。
+func SkillSummary(skills []skill.Skill) string {
+	if len(skills) == 0 {
+		return "无技能"
+	}
+	var project, user, builtin int
+	for _, s := range skills {
+		switch s.Source {
+		case skill.SourceProject:
+			project++
+		case skill.SourceUser:
+			user++
+		case skill.SourceBuiltin:
+			builtin++
+		}
+	}
+	return fmt.Sprintf("技能 %d 个 · 项目 %d 用户 %d 内置 %d", len(skills), project, user, builtin)
+}
+
+// oneLineDesc 把描述压成一行，避免把清单的行距撑乱。
+func oneLineDesc(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// ApprovalRulesSummary 生成审批规则的清单文本，供 TUI 的 /rules 与 `arkperf rules` 共用。
+//
+// 说明**怎么删**是必须的：规则只会减少询问，一条过宽的规则就是静默的陷阱。
+// 现在还没有删除命令，用户得知道出路在哪个文件里。
+func ApprovalRulesSummary(r *kernel.ApprovalRules) string {
+	if r == nil {
+		return "审批规则不可用（文件读不出来，本次按「每次都问」处理）"
+	}
+	rules := r.List()
+	if len(rules) == 0 {
+		return "没有已保存的审批规则：需要审批的工具每次都会问"
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "已保存 %d 条审批规则（这些类别不再询问）：\n", len(rules))
+	for _, rule := range rules {
+		fmt.Fprintf(&sb, "  %-16s %s\n", rule.Tool, rule.Scope)
+	}
+	fmt.Fprintf(&sb, "\n要取消某一条：编辑 %s 后重启；或在审批卡上不再按 A", r.Path())
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // DeviceReport 生成设备列表报告。

@@ -45,16 +45,28 @@ func assistantToolCall(id, name, args string) ChatResponse {
 
 type yesApprover struct{ asked int }
 
-func (a *yesApprover) Ask(context.Context, string, map[string]any) (bool, error) {
+func (a *yesApprover) Ask(context.Context, string, map[string]any, string) (ApprovalDecision, error) {
 	a.asked++
-	return true, nil
+	return ApprovalOnce, nil
 }
 
 type noApprover struct{ asked int }
 
-func (a *noApprover) Ask(context.Context, string, map[string]any) (bool, error) {
+func (a *noApprover) Ask(context.Context, string, map[string]any, string) (ApprovalDecision, error) {
 	a.asked++
-	return false, nil
+	return ApprovalDeny, nil
+}
+
+// alwaysApprover 模拟用户选了"这一类以后都不问"，并记下内核给的类别。
+type alwaysApprover struct {
+	asked     int
+	lastScope string
+}
+
+func (a *alwaysApprover) Ask(_ context.Context, _ string, _ map[string]any, scope string) (ApprovalDecision, error) {
+	a.asked++
+	a.lastScope = scope
+	return ApprovalAlways, nil
 }
 
 func TestRunLoop_ToolThenFinalAnswer(t *testing.T) {

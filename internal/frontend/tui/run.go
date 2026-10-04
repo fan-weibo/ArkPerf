@@ -40,6 +40,19 @@ type Options struct {
 	// ToolchainReport / DeviceReport 分别服务 /check 与 /devices。
 	ToolchainReport func(ctx context.Context) (string, error)
 	DeviceReport    func(ctx context.Context) (string, error)
+	// SkillReport 服务 /skills：三层技能目录、每个技能的来源路径、被跳过的坏文件。
+	//
+	// 与上面两个同样是注入的闭包：TUI 既不知道 app、也不 import skill，
+	// 它只需要一段能直接打印的文本。用闭包而不是固定值，是因为工作目录
+	// 会随 /cd 变化，而项目级技能就挂在 <工作目录>/.arkperf/skills 下。
+	SkillReport func() string
+	// SkillSummary 是一行技能摘要（如 "技能 3 个 · 内置 3"），供状态行与 /status。
+	SkillSummary func() string
+	// RulesReport 服务 /rules：列出已保存的审批规则。
+	//
+	// 规则只会**减少询问**，一条过宽的规则是个静默的陷阱——用户得有个地方
+	// 看见自己到底放行了什么。同样是注入的闭包，TUI 不碰 kernel 的规则文件。
+	RulesReport func() string
 
 	// SessionTurns / SessionRetained 用于在状态行展示会话规模。
 	// 两者都为空表示单轮模式。
