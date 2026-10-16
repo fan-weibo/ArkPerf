@@ -690,22 +690,6 @@ func TestWorkingLineOnlyWhileRunning(t *testing.T) {
 	}
 }
 
-func TestClearResetsTranscript(t *testing.T) {
-	h := newHarness(t, false)
-	h.submit("/help")
-	if len(h.m.transcript) == 0 {
-		t.Fatal("前置条件：应有转录内容")
-	}
-
-	h.m.Update(resetView{})
-	if len(h.m.transcript) != 0 {
-		t.Fatalf("清屏后内存转录应清空，实际 %d 条", len(h.m.transcript))
-	}
-}
-
-// TestViewLinesFitWithinTerminalWidth 是布局的硬约束：
-// 每一行的显示宽度都不能超过终端宽度。
-//
 // 这类问题只能靠测量——CJK 占 2 列、ANSI 序列占 0 列，
 // 肉眼看"对齐"完全不可靠；一旦某行超宽，终端就会折行，
 // 整块底部区域会错位（而且只在特定宽度/特定中文内容下才复现）。
@@ -1094,38 +1078,6 @@ func TestViewDefaultsToMouseCapture(t *testing.T) {
 	h.m.View()
 	if got := h.m.View().MouseMode; got != tea.MouseModeCellMotion {
 		t.Fatalf("默认 MouseMode = %v，应为 MouseModeCellMotion（滚轮+内置选中）", got)
-	}
-}
-
-// TestMouseCommandTogglesCapture 锁定 /mouse 在两种鼠标模式间切换，
-// 且 View 立刻反映出来：开=滚轮+内置选中（CellMotion），关=交还终端（None）。
-func TestMouseCommandTogglesCapture(t *testing.T) {
-	h := newHarness(t, false)
-	h.m.width, h.m.height = 60, 20
-	h.m.resizeInput()
-	h.m.View()
-
-	if h.m.mouseCaptureOff {
-		t.Fatal("初始应为 mouseCaptureOff=false（开捕获）")
-	}
-	if got := h.m.View().MouseMode; got != tea.MouseModeCellMotion {
-		t.Fatalf("初始 MouseMode = %v，应为 CellMotion", got)
-	}
-
-	cmdMouse(h.m, "")
-	if !h.m.mouseCaptureOff {
-		t.Fatal("/mouse 后应关掉捕获")
-	}
-	if got := h.m.View().MouseMode; got != tea.MouseModeNone {
-		t.Fatalf("关捕获后 MouseMode = %v，应为 None", got)
-	}
-
-	cmdMouse(h.m, "")
-	if h.m.mouseCaptureOff {
-		t.Fatal("再次 /mouse 应回到开捕获")
-	}
-	if got := h.m.View().MouseMode; got != tea.MouseModeCellMotion {
-		t.Fatalf("再次开捕获后 MouseMode = %v，应为 CellMotion", got)
 	}
 }
 

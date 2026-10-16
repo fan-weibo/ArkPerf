@@ -99,10 +99,6 @@ func TestCommandsTableIsWellFormed(t *testing.T) {
 		}
 		seen[c.Name] = true
 	}
-	// quit 是 exit 的别名，两条都必须在，否则用户按习惯敲 /quit 会得到"未知命令"
-	if !seen["exit"] || !seen["quit"] {
-		t.Fatal("exit 与 quit 都必须存在")
-	}
 	if !seen["skills"] {
 		t.Fatal("技能清单是纯数据能力，必须有对应命令")
 	}

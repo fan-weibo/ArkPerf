@@ -42,9 +42,13 @@ const (
 	// （opencode: 44 / 64）。显示侧栏与否看的是**偏好宽**。
 	contentMinW       = 44
 	contentPreferredW = 64
-	// paneListTop 是侧栏里列表的起始行（第 0 行是标题，第 1 行留空）。
+	// paneListTop 是**右栏**里列表的起始行（第 0 行是标题，第 1 行留空）。
 	// 点击映射靠它把屏幕行换算成列表下标，必须与渲染保持一致。
 	paneListTop = 2
+	// sessionListTop 是**左栏**里列表的起始行：第 0 行标题，
+	// 第 1-3 行是「+ New session」按钮（圆角边框三行），列表从第 4 行起。
+	// 两栏的头部高度不同，所以拆成两个常量；都必须与渲染保持一致。
+	sessionListTop = 4
 	// paneItemRows 是每个会话项占的行数（标题一行 + 元信息一行）。
 	paneItemRows = 2
 )
@@ -126,14 +130,15 @@ func (m *Model) paneAt(x int) paneHit {
 
 // sessionIndexAt 把左栏内的屏幕行换算成会话下标；-1 表示不是会话行。
 //
-// 换算必须与 sessionsPaneLines 的排版一致：标题占第 0 行、空行占第 1 行，
+// 换算必须与 sessionsPaneLines 的排版一致：标题占第 0 行、
+// 「+ New session」按钮占第 1-3 行（点击走 newSessionFromPane，不进这里），
 // 之后每项占 paneItemRows 行。改排版就要同步改这里。
 func (m *Model) sessionIndexAt(y int) int {
-	if y < paneListTop {
+	if y < sessionListTop {
 		return -1
 	}
 	// 加滚动偏移：标题区固定不动，只有列表跟着滚（见 paneViewport）
-	idx := (y - paneListTop + m.sessionsScroll) / paneItemRows
+	idx := (y - sessionListTop + m.sessionsScroll) / paneItemRows
 	if idx < 0 || idx >= len(m.sessionsCache) {
 		return -1
 	}
@@ -317,11 +322,23 @@ func (m *Model) sessionsPaneLines(w int) []string {
 	head := styleAccent.Bold(true).Render("Sessions") +
 		styleDim.Render(fmt.Sprintf(" %d", len(m.sessionsCache))) +
 		styleDim.Render("  ⊟")
+	// 「+ New session」按钮：圆角边框三行、撑满栏宽，做成一个**真的按钮**——
+	// 第一版是单行 dim 文本，用户反馈"太小了，不显眼"。边框用 dim、文字用
+	// 普通亮度：框提供结构，字保持可读。占第 1-3 行（sessionListTop 之前），
+	// 不随列表滚动、恒在顶部，列表的 y→下标映射不受影响。
+	label := "+ New session"
+	btn := []string{
+		styleDim.Render("╭" + strings.Repeat("─", inner-2) + "╮"),
+		styleDim.Render("│") + " " + label +
+			strings.Repeat(" ", max(inner-4-len(label), 0)) + " " +
+			styleDim.Render("│"),
+		styleDim.Render("╰" + strings.Repeat("─", inner-2) + "╯"),
+	}
 	if len(m.sessionsCache) == 0 {
-		return []string{head, "", styleDim.Render("（暂无会话）")}
+		return append([]string{head}, append(btn, styleDim.Render("（暂无会话）"))...)
 	}
 
-	lines := []string{head, ""}
+	lines := append([]string{head}, btn...)
 	for i, s := range m.sessionsCache {
 		mark := "  "
 		title := styleBold
@@ -492,21 +509,22 @@ func (m *Model) endDrag() { m.dragging = paneDragNone }
 
 // paneViewport 把侧栏内容裁进高度 h 的窗口，需要时在最后一列画滚动条。
 //
-// 前 paneListTop 行是标题区，**固定不动**；只有列表部分滚动。
+// 前 listTop 行是标题区，**固定不动**；只有列表部分滚动。
 // 标题跟着滚走的话，用户滚到一半就不知道这一栏是什么了
 // （opencode 的 scrollbox 也是只滚内容，标题留在外面）。
+// 左栏传 sessionListTop（它有按钮区），右栏传 paneListTop。
 //
 // contentW 是**含滚动条列**的宽度（即 renderPane 的内容宽）：
 // 文本占 contentW-1 列，最后一列留给滚动条。滚动条位**永远保留**
 // （不管这一帧需不需要）——宽度随"要不要滚动条"变化的话，
 // 内容会在滚动到一半时整体重排，比白白浪费一列难看得多。
-func paneViewport(lines []string, scroll, contentW, h int) []string {
+func paneViewport(lines []string, scroll, contentW, h, listTop int) []string {
 	if contentW <= 0 || h <= 0 {
 		return nil
 	}
 	textW := max(contentW-1, 1)
-	head := lines[:min(paneListTop, len(lines))]
-	body := lines[min(paneListTop, len(lines)):]
+	head := lines[:min(listTop, len(lines))]
+	body := lines[min(listTop, len(lines)):]
 
 	maxScroll := max(len(body)-(h-len(head)), 0)
 	sc := clamp(scroll, 0, maxScroll)
@@ -801,11 +819,33 @@ func sessionTitle(b SessionBrief) string {
 // ---------------------------------------------------------------- 点击
 
 // clickSessions 处理左栏的点击：标题行折叠/展开，其余行切换会话。
+// newSessionFromPane 是左栏「+ New session」动作行（y==1）的处理。
+//
+// 与 /new 的差别只在收尾：这里把**启动时那块横幅**（装配摘要 + 新会话提示）
+// 重新打出来——用户要的是"点了之后跟刚启动的界面一样，最上面是有东西的"，
+// 而不是 /new 那种一屏空白。横幅渲染复用 printBanner，两处必然一致。
+func (m *Model) newSessionFromPane() tea.Cmd {
+	if m.opts.ResetSession == nil {
+		return m.print(styleDim.Render("（当前不支持新建会话）"))
+	}
+	if err := m.opts.ResetSession(); err != nil {
+		return m.print(styleErr.Render("✗ 新建会话失败：" + err.Error()))
+	}
+	m.resetViewState()
+	m.refreshSessions() // 新会话的 Current 标记要在列表里同步，旧会话的标记要摘掉
+	m.printBanner()
+	return nil
+}
+
 func (m *Model) clickSessions(y int) (tea.Model, tea.Cmd) {
 	if y == 0 {
 		// 标题行（折叠态下就是那个图标）：折叠 / 展开。
 		// 标题行不承担"选会话"——否则用户想收起侧栏却误切了会话。
 		return m.toggleSessionsWithNotice()
+	}
+	if y >= 1 && y <= 3 {
+		// 「+ New session」按钮的三行（边框 + 文字）都算按钮，点哪都触发。
+		return m, m.newSessionFromPane()
 	}
 	if !m.showSessions {
 		return m, nil

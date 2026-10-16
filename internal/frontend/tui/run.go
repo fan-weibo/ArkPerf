@@ -74,8 +74,12 @@ type Options struct {
 	SessionRetained func() int
 	// SessionCompacted 返回已被压缩的工具输出条数。
 	SessionCompacted func() int
-	// ResetSession 开始新会话（/new）：清空上下文并新建持久化记录。
+	// ResetSession 开始新会话（左栏「+ New session」按钮）：清空上下文并新建持久化记录。
 	ResetSession func() error
+	// RenameSession / DeleteSession 供 /rename 与 /delete 使用。
+	// 能力在装配层早已备好（注释里写着"侧栏重命名/移除"），这里只是接线。
+	RenameSession func(id, title string) error
+	DeleteSession func(id string) error
 	// Sessions 列出**当前工作区**的会话（/sessions）。
 	//
 	// 与其他注入项同一条理由：TUI 不 import app，也不自己去翻会话目录。

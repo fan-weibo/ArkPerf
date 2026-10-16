@@ -46,9 +46,6 @@ type event struct {
 // notice 是前端自身的提示行（不来自内核）。
 type notice struct{ text string }
 
-// resetView 请求清空转录并重画底部区域。
-type resetView struct{}
-
 // RunFunc 执行一次任务。由调用方注入，因此 TUI 不必知道内核细节，
 // 测试里也能塞一个假执行器。
 type RunFunc func(ctx context.Context, task string) (kernel.LoopResult, error)

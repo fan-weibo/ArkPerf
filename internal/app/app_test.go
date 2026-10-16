@@ -108,3 +108,60 @@ func TestOpenRestoresLatestSessionAndResetClearsIt(t *testing.T) {
 		t.Fatalf("Save 失败：%v", err)
 	}
 }
+
+// LoadByID / DeleteSession / SetWorkspace 都不得更换 Conversation 指针：
+// TUI 的 runner 在启动时就抓着它，换了之后每轮对话写旧对象、Save 读新对象，
+// 落盘的全是空会话（实测踩过：对话了 1 轮，列表 messages=null）。
+func TestSessionSwitchesKeepConversationPointer(t *testing.T) {
+	setupHome(t)
+
+	s, err := Open(context.Background(), Options{NoMCP: true})
+	if err != nil {
+		t.Fatalf("Open 失败：%v", err)
+	}
+	defer s.Close()
+
+	// 当前会话塞一轮内容并落盘，让列表里出现第二个可切换的会话
+	s.mu.Lock()
+	s.sess.Messages = []kernel.Message{{Role: "user", Content: "第一轮"}}
+	s.mu.Unlock()
+	if err := s.Save(); err != nil {
+		t.Fatalf("落盘失败：%v", err)
+	}
+
+	before := s.conv
+
+	// + New session 的路径（Reset 是就地操作，指针不许动）
+	if err := s.Reset(); err != nil {
+		t.Fatalf("Reset 失败：%v", err)
+	}
+	if s.conv != before {
+		t.Fatal("Reset 换了 Conversation 指针")
+	}
+
+	// LoadByID 切回第一个会话（同目录）
+	id := ""
+	for _, x := range s.Sessions() {
+		if x.ID != s.CurrentID() {
+			id = x.ID
+			break
+		}
+	}
+	if id == "" {
+		t.Fatal("前置条件：应存在另一个可切换的会话")
+	}
+	if err := s.LoadByID(id); err != nil {
+		t.Fatalf("LoadByID 失败：%v", err)
+	}
+	if s.conv != before {
+		t.Fatal("LoadByID 换了 Conversation 指针——TUI 的 runner 会失联")
+	}
+
+	// DeleteSession（删的是切换后的当前会话）也不得换指针
+	if err := s.DeleteSession(s.CurrentID()); err != nil {
+		t.Fatalf("DeleteSession 失败：%v", err)
+	}
+	if s.conv != before {
+		t.Fatal("DeleteSession 换了 Conversation 指针")
+	}
+}

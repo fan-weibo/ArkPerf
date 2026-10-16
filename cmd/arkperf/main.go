@@ -661,6 +661,8 @@ func tuiCmd() *cobra.Command {
 				SessionRetained:  sess.Retained,
 				SessionCompacted: sess.Compacted,
 				ResetSession:     sess.NewSession,
+				RenameSession:    sess.RenameSession,
+				DeleteSession:    sess.DeleteSession,
 				StartupNotice:    notice,
 				InitialReplay:    initial,
 				// 右栏文件树：与 /sessions 同理，TUI 不碰文件系统。

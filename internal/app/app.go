@@ -372,7 +372,10 @@ func (s *Session) DeleteSession(id string) error {
 	} else {
 		s.sess = s.store.New(s.cwd)
 	}
-	s.conv = kernel.NewConversation()
+	// 就地 Reset + Restore，不换 Conversation 指针——
+	// TUI 的 runner 在启动时就抓着它，换了它就失联：
+	// 之后每轮对话写进旧对象、Save 读新对象，落盘的全是空会话（实测踩过）。
+	s.conv.Reset()
 	s.conv.Restore(s.sess.Messages)
 	s.restored = s.sess
 	return nil
@@ -453,7 +456,12 @@ func (s *Session) LoadByID(id string) error {
 		return fmt.Errorf("该会话属于其他工作目录（%s），不能在当前目录里切换", sess.CWD)
 	}
 	s.sess = sess
-	s.conv = kernel.NewConversation()
+	// 就地 Reset + Restore：这个函数头上的注释说"runner 还抓着旧的
+	// Conversation"——运行中的任务如此，**空闲时的 TUI 也一样**：
+	// 它的 runner 是启动时构造的，抓着启动那一刻的指针。
+	// 这里一旦换指针，之后每轮对话都会写进旧对象、Save 读新对象，
+	// 落盘的全是空会话（实测踩过：对话了 1 轮，列表里 messages=null）。
+	s.conv.Reset()
 	s.conv.Restore(sess.Messages)
 	s.restored = sess
 	return nil

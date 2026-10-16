@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -37,12 +36,9 @@ func commands() []SlashCommand {
 		{Name: "yes", Help: "切换自动批准（免确认执行危险工具）", Run: cmdYes},
 		{Name: "rules", Help: "查看已保存的审批规则（哪些类别不再询问）", Run: cmdRules},
 		{Name: "status", Help: "显示当前装配状态", Run: cmdStatus},
-		{Name: "new", Help: "开始新会话（清空上下文与屏幕）", Run: cmdNew},
-		{Name: "sessions", Help: "列出当前工作区的会话；/sessions <序号> 切过去", Run: cmdSessions},
-		{Name: "clear", Help: "清空屏幕上的转录（不影响上下文）", Run: cmdClear},
-		{Name: "mouse", Help: "切换鼠标捕获：开=滚轮+内置选中，关=交还终端原生划选", Run: cmdMouse},
+		{Name: "rename", Help: "重命名当前会话：/rename 新名字（空串恢复自动标题）", Run: cmdRename},
+		{Name: "delete", Help: "删除当前会话（不可恢复；自动切到最近的会话）", Run: cmdDelete},
 		{Name: "exit", Help: "退出 TUI", Run: cmdExit},
-		{Name: "quit", Help: "退出 TUI（同 /exit）", Run: cmdExit},
 	}
 }
 
@@ -67,6 +63,11 @@ func (m *Model) runSlash(name string, arg *string) (tea.Model, tea.Cmd) {
 	m.slashActive = false
 	m.slashMatches = nil
 	m.input.SetValue("")
+	// 非 delete 的命令都会取消待确认的删除：意图已经变了，
+	// "再敲一次 /delete"不能一直挂着等人误触。
+	if name != "delete" {
+		m.deletePendingID = ""
+	}
 	argVal := ""
 	if arg != nil {
 		argVal = *arg
@@ -227,85 +228,6 @@ func cmdStatus(m *Model, _ string) tea.Cmd {
 	return m.print(strings.Join(lines, "\n"))
 }
 
-// cmdNew 开始新会话：清空模型上下文并新建持久化记录。
-//
-// **屏幕一起清掉**。旧版留着上一段对话，理由是"那是历史记录"——
-// 但用户的心智是"我开了个新会话"：屏幕还挂着旧对话就不像新的，
-// 也容易出现"屏幕上写着 A、模型手里是空的"这种错位。
-// 旧会话并没有丢：每轮任务结束都落过盘，可以用 /sessions 切回去。
-func cmdNew(m *Model, _ string) tea.Cmd {
-	if m.opts.ResetSession == nil {
-		return m.print(styleDim.Render("（当前不支持新建会话）"))
-	}
-	if err := m.opts.ResetSession(); err != nil {
-		return m.print(styleErr.Render("✗ 新建会话失败：" + err.Error()))
-	}
-	m.resetViewState()
-	return m.print(styleWarn.Render("已开始新会话：上下文与屏幕都已清空") + "\n" +
-		styleDim.Render("之前的对话仍在磁盘上，用 /sessions 可以切回去"))
-}
-
-// cmdSessions 列出当前工作区的会话；带序号则切过去。
-//
-// 为什么需要它：TUI 是交付形态之一，但在它之前**没有任何办法切回旧会话**——
-// /new 之后那段对话就只能靠桌面端侧栏找回来（实测被用户问到"新旧会话怎么切"）。
-func cmdSessions(m *Model, arg string) tea.Cmd {
-	if m.opts.Sessions == nil {
-		return m.print(styleDim.Render("（当前不支持会话列表）"))
-	}
-
-	list := m.opts.Sessions()
-	arg = strings.TrimSpace(arg)
-
-	if arg == "" {
-		if len(list) == 0 {
-			return m.print(styleDim.Render("当前工作区还没有会话（发第一条消息后就会出现）"))
-		}
-		var b strings.Builder
-		fmt.Fprintf(&b, "%s\n", styleBold.Render(fmt.Sprintf("当前工作区的会话（%d）", len(list))))
-		for i, s := range list {
-			mark := "  "
-			if s.Current {
-				mark = styleAccent.Render("▸ ")
-			}
-			fmt.Fprintf(&b, "%s%d. %s  %s\n", mark, i+1, s.Title,
-				styleDim.Render(fmt.Sprintf("(%d 轮 · %s)", s.Turns, s.Updated)))
-		}
-		b.WriteString(styleDim.Render("用法：/sessions <序号> 切过去（会清屏并回放该会话的历史）"))
-		return m.print(strings.TrimRight(b.String(), "\n"))
-	}
-
-	idx, err := strconv.Atoi(arg)
-	if err != nil || idx < 1 || idx > len(list) {
-		return m.print(styleErr.Render(fmt.Sprintf("✗ 序号无效：%s（先输 /sessions 看列表）", arg)))
-	}
-	target := list[idx-1]
-	if target.Current {
-		return m.print(styleDim.Render("已经在这个会话里了"))
-	}
-	if m.opts.OpenSession == nil {
-		return m.print(styleDim.Render("（当前不支持切换会话）"))
-	}
-
-	lines, dir, err := m.opts.OpenSession(target.ID)
-	if err != nil {
-		return m.print(styleErr.Render("✗ 切换会话失败：" + err.Error()))
-	}
-
-	// 工作区可能跟着会话一起切了：状态行必须以返回值更新，
-	// 否则屏幕写着旧目录、模型实际在新目录里干活。
-	m.opts.CWD = dir
-	m.replay(lines)
-	return m.print(styleWarn.Render("已切到会话："+target.Title) + "\n" +
-		styleDim.Render(fmt.Sprintf("工作区 %s · %d 轮 · 屏幕已回放该会话的历史",
-			dir, target.Turns)))
-}
-
-func cmdClear(m *Model, _ string) tea.Cmd {
-	// 交给 Update 统一处理：那里既能清内存副本，也能清屏
-	return func() tea.Msg { return resetView{} }
-}
-
 // /cd（在 TUI 内切换工作区）已移除。
 //
 // 换工作区现在只有两条路：换目录再启动，或者切到别的目录的会话
@@ -315,19 +237,99 @@ func cmdClear(m *Model, _ string) tea.Cmd {
 //
 // 装配层的 SetWorkspace 仍在（跨工作区的会话切换依赖它）。
 
-func cmdExit(_ *Model, _ string) tea.Cmd { return tea.Quit }
-
-// cmdMouse 切换鼠标捕获（学自 Reasonix 的 /mouse）。
-//
-// 默认是**开捕获**：滚轮/滚动条和 app 内选中（左键拖拽→反色→松手自动复制）
-// 同时可用。关掉捕获是把鼠标交还终端，用它的原生划选/右键菜单——
-// 只有 SSH/Termux 这类"终端本地复制更靠谱"的环境才需要。
-func cmdMouse(m *Model, _ string) tea.Cmd {
-	m.mouseCaptureOff = !m.mouseCaptureOff
-	// 关捕获时清掉 app 内选区：鼠标已经交还终端，这套高亮没意义了
-	m.sel = selection{}
-	if m.mouseCaptureOff {
-		return m.print(styleDim.Render("已关闭鼠标捕获：改用终端原生划选/右键菜单（滚轮失效，回看用 PageUp / PageDown）"))
+// currentSessionID 返回当前会话的 id；列表里找不到（新会话还没落盘）则返回空串。
+func (m *Model) currentSessionID() string {
+	for _, s := range m.sessionsCache {
+		if s.Current {
+			return s.ID
+		}
 	}
-	return m.print(styleDim.Render("已开启鼠标捕获：滚轮/滚动条可用；左键拖拽选中文字，Ctrl+C 复制"))
+	return ""
 }
+
+// cmdRename 重命名当前会话。
+//
+// 参数整串当名字（允许空格）；空串恢复"第一条提问"的自动标题（kernel.Rename 的语义）。
+// 只对列表里的会话有效：新会话还没落盘，没有文件可改名。
+func cmdRename(m *Model, arg string) tea.Cmd {
+	if m.opts.RenameSession == nil {
+		return m.print(styleDim.Render("（当前不支持重命名会话）"))
+	}
+	arg = strings.TrimSpace(arg)
+	id := m.currentSessionID()
+	if id == "" {
+		return m.print(styleDim.Render("当前会话还没有内容，先聊一轮再来命名它"))
+	}
+	if err := m.opts.RenameSession(id, arg); err != nil {
+		return m.print(styleErr.Render("✗ 重命名失败：" + err.Error()))
+	}
+	m.refreshSessions()
+	if arg == "" {
+		return m.print(styleDim.Render("已清除自定义名，恢复自动标题"))
+	}
+	return m.print(styleDim.Render("已重命名：" + arg))
+}
+
+// currentSessionTitle 返回当前会话的展示标题（自定义名或会话 id）；找不到返回空串。
+func (m *Model) currentSessionTitle() string {
+	for _, s := range m.sessionsCache {
+		if s.Current {
+			if t := strings.TrimSpace(s.Title); t != "" {
+				return t
+			}
+			return s.ID
+		}
+	}
+	return ""
+}
+
+// cmdDelete 删除当前会话（不可恢复），**两段式确认**：
+// 第一次只提示（会话名），第二次才真删。
+//
+// 待确认时记录的是**被确认的那个会话 id**——第二次删它，而不是删的时候
+// 重新取当前会话：中间切了会话的话，删的也该是用户看过确认提示的那个。
+// 任何其他提交（别的命令、普通消息）都会取消待确认状态。
+func cmdDelete(m *Model, _ string) tea.Cmd {
+	if m.opts.DeleteSession == nil {
+		return m.print(styleDim.Render("（当前不支持删除会话）"))
+	}
+
+	id := m.deletePendingID
+	if id == "" {
+		id = m.currentSessionID()
+		if id == "" {
+			return m.print(styleDim.Render("当前会话还没有内容——点左栏的 + New session 开新的就行"))
+		}
+		m.deletePendingID = id
+		return m.print(styleWarn.Render(fmt.Sprintf(
+			"⚠ 将删除会话「%s」，不可恢复。确认的话再敲一次 /delete；敲其他命令取消。",
+			m.currentSessionTitle())))
+	}
+	m.deletePendingID = ""
+
+	if err := m.opts.DeleteSession(id); err != nil {
+		return m.print(styleErr.Render("✗ 删除失败：" + err.Error()))
+	}
+	m.refreshSessions()
+	// 找删后的当前会话，把它的历史回放到屏幕上
+	for _, s := range m.sessionsCache {
+		if !s.Current {
+			continue
+		}
+		if lines, dir, err := m.opts.OpenSession(s.ID); err == nil {
+			if dir != "" {
+				m.opts.CWD = dir
+				m.resetFilesView()
+				m.refreshFiles()
+			}
+			m.replay(lines)
+			return m.print(styleDim.Render("已删除会话；已切到「" + s.Title + "」"))
+		}
+	}
+	// 一条都不剩：回到新会话的空白 + 横幅
+	m.resetViewState()
+	m.printBanner()
+	return m.print(styleDim.Render("已删除会话；这是新的开始"))
+}
+
+func cmdExit(_ *Model, _ string) tea.Cmd { return tea.Quit }

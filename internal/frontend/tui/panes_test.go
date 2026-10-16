@@ -151,8 +151,8 @@ func TestClickSessionSwitchesImmediately(t *testing.T) {
 	h := newPanesHarness(t)
 	h.resize(160, 30)
 
-	// 列表从第 2 行开始、每项 2 行：idx1（帧率分析）落在 y=4
-	h.m.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 2, Y: 4})
+	// 列表从第 4 行开始（标题 1 行 + 按钮 3 行）、每项 2 行：idx1（帧率分析）落在 y=6
+	h.m.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 2, Y: 6})
 
 	if h.m.sessionIdx != 1 {
 		t.Fatalf("高亮项应为 1，实得 %d", h.m.sessionIdx)
@@ -607,5 +607,183 @@ func TestScrollbarClickDoesNotStartSelection(t *testing.T) {
 	h.m.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: col, Y: 3})
 	if h.m.sel.active {
 		t.Fatalf("点滚动条不该开始选区：%+v", h.m.sel)
+	}
+}
+
+// 左栏第 1 行固定是「+ New session」——新建会话的可见入口（对齐 opencode）。
+// 空列表时也要有：那正是新用户第一次看到界面时的状态。
+func TestSessionPaneShowsNewSessionRow(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	if c := ansi.Strip(h.m.View().Content); !strings.Contains(c, "+ New session") {
+		t.Fatalf("左栏应显示 + New session 行：\n%s", c)
+	}
+}
+
+// 点「+ New session」行（y=1）：触发 ResetSession，并像刚启动一样
+// 把装配横幅重新打出来——而不是 /new 那种一屏空白。
+func TestClickNewSessionRow(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	called := false
+	h.m.opts.ResetSession = func() error { called = true; return nil }
+	h.m.opts.StartupNotice = "arkperf · deepseek-flash · 43 工具\n新会话。上下文跨轮保留。"
+
+	h.m.print("旧内容") // 先让屏幕上有东西，验证点击后会清掉
+
+	h.m.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 5, Y: 1})
+
+	if !called {
+		t.Fatal("点击 + New session 应触发 ResetSession")
+	}
+	c := ansi.Strip(h.m.View().Content)
+	if !strings.Contains(c, "deepseek-flash") || !strings.Contains(c, "新会话。上下文跨轮保留。") {
+		t.Fatalf("点击后应重打启动横幅：\n%s", c)
+	}
+	if strings.Contains(c, "旧内容") {
+		t.Fatal("点击后应清掉旧转录")
+	}
+}
+
+// /rename：重命名列表里 Current 的会话，并刷新左栏。
+func TestRenameCommandRenamesCurrent(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	var gotID, gotTitle string
+	h.m.opts.RenameSession = func(id, title string) error {
+		gotID, gotTitle = id, title
+		return nil
+	}
+
+	h.submit("/rename 冷启动基线")
+
+	if gotID != "s1" || gotTitle != "冷启动基线" {
+		t.Fatalf("应重命名当前会话 s1，实得 %q / %q", gotID, gotTitle)
+	}
+}
+
+// /rename 空参：清除自定义名（恢复自动标题）。
+func TestRenameCommandEmptyArgClearsTitle(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	var gotTitle string
+	h.m.opts.RenameSession = func(id, title string) error {
+		gotTitle = title
+		return nil
+	}
+
+	h.submit("/rename ")
+
+	if gotTitle != "" {
+		t.Fatalf("空参应传空串恢复自动标题，实得 %q", gotTitle)
+	}
+}
+
+// 当前会话不在列表里（新会话未落盘）：rename/delete 都应给出提示而不是空转。
+func TestSessionCommandsSkipUnlistedSession(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+	h.m.opts.Sessions = func() []SessionBrief { return nil }
+	h.m.refreshSessions() // 让 cache 跟上（模拟"列表已经空了"的运行时状态）
+	// 注入空实现：让它走到「会话不在列表」的分支，而不是「未注入」的分支
+	h.m.opts.RenameSession = func(id, title string) error { return nil }
+	h.m.opts.DeleteSession = func(id string) error { return nil }
+
+	h.submit("/rename 新名字")
+	if out := h.allTranscript(); !strings.Contains(out, "还没有内容") {
+		t.Fatalf("rename 应提示会话还没有内容：\n%s", out)
+	}
+
+	h.submit("/delete")
+	if out := h.allTranscript(); !strings.Contains(out, "+ New session") {
+		t.Fatalf("delete 应提示用 + New session 开新的：\n%s", out)
+	}
+}
+
+// /delete：删掉当前会话后自动切到最近的替代并回放其历史。
+//
+// DeleteSession 的 spy 顺带更新 Sessions——模拟装配层的真实行为：
+// 删掉当前会话后 Current 自动落到最近的替代上。
+func TestDeleteCommandDeletesAndSwitches(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	deleted := ""
+	h.m.opts.DeleteSession = func(id string) error {
+		deleted = id
+		h.m.opts.Sessions = func() []SessionBrief {
+			return []SessionBrief{{ID: "s2", Title: "帧率分析", Turns: 8, Current: true}}
+		}
+		return nil
+	}
+
+	h.submit("/delete")
+	if deleted != "" {
+		t.Fatal("第一次 /delete 只应提示确认，不应删除")
+	}
+	if out := h.allTranscript(); !strings.Contains(out, "不可恢复") {
+		t.Fatalf("第一次应给出确认提示：\n%s", out)
+	}
+
+	h.submit("/delete") // 确认
+	if deleted != "s1" {
+		t.Fatalf("确认后应删除当前会话 s1，实得 %q", deleted)
+	}
+	if out := h.allTranscript(); !strings.Contains(out, "历史：s2") {
+		t.Fatalf("应回放新当前会话的历史：\n%s", out)
+	}
+	if out := h.allTranscript(); !strings.Contains(out, "已切到「帧率分析」") {
+		t.Fatalf("应提示已切到替代会话：\n%s", out)
+	}
+}
+
+// /delete：删到最后一条都不剩 → 回到新会话的空白 + 横幅。
+func TestDeleteCommandWhenListEmpties(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	h.m.opts.DeleteSession = func(id string) error {
+		h.m.opts.Sessions = func() []SessionBrief { return nil }
+		return nil
+	}
+
+	h.submit("/delete") // 第一次：只提示
+	h.submit("/delete") // 确认
+
+	if out := h.allTranscript(); !strings.Contains(out, "这是新的开始") {
+		t.Fatalf("删空后应提示新的开始：\n%s", out)
+	}
+}
+
+// 待确认状态下敲了别的命令或发了消息：取消待确认，
+// 之后的 /delete 要重新走一遍确认——不能让"再敲一次"挂十分钟后的误删。
+func TestDeleteConfirmCancelledByOtherInput(t *testing.T) {
+	h := newPanesHarness(t)
+	h.resize(160, 30)
+
+	deleted := ""
+	h.m.opts.DeleteSession = func(id string) error { deleted = id; return nil }
+
+	h.submit("/delete") // 待确认
+	h.submit("/help")   // 别的命令：取消
+	h.submit("/delete") // 重新待确认
+	if deleted != "" {
+		t.Fatal("取消后的 /delete 应重新进入待确认，不应直接删")
+	}
+
+	h.submit("/delete") // 确认
+	if deleted != "s1" {
+		t.Fatalf("确认后应删除，实得 %q", deleted)
+	}
+
+	h.submit("/delete") // 又一次待确认
+	h.submit("普通消息")    // 发消息：同样取消（会走 startTask，未注入执行器只打提示）
+	h.submit("/delete") // 重新待确认
+	if deleted != "s1" {
+		t.Fatal("发消息取消后的 /delete 也不应直接删")
 	}
 }

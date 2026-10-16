@@ -229,6 +229,10 @@ type Model struct {
 	// barDragging 表示正在用鼠标拖它。
 	barVisible  bool
 	barDragging bool
+	// deletePendingID 非空表示 /delete 处于待确认状态，记录的是**被确认要删的
+	// 那个会话 id**——第二次 /delete 删的是它，而不是删的时候重新取的当前会话
+	//（中间切了会话也不该改目标）。任何其他提交都会把它清掉。
+	deletePendingID string
 
 	// animFrame 是动画帧计数，随 spinner 的 tick 递增（shimmer 用它算高光位置）。
 	// 不单起定时器：已有的 tick 就是现成的时钟，而且只在任务运行时才走。
@@ -304,20 +308,27 @@ func NewModel(ctx context.Context, o Options, b *Bridge) *Model {
 	return m
 }
 
+// printBanner 把启动横幅按固定样式打进转录：第一行是身份（◆ 名字 · 模型 ·
+// 工具），其余行是 dim 提示。内容由 main.go 组装，这里只负责配色。
+//
+// 启动（Init）与左栏「+ New session」共用——用户要求点它之后"跟刚启动的
+// 界面一样，最上面是有东西的"，两处必须长得一模一样，所以渲染只有这一份。
+func (m *Model) printBanner() {
+	if m.opts.StartupNotice == "" {
+		return
+	}
+	parts := strings.SplitN(m.opts.StartupNotice, "\n", 2)
+	out := styleAccent.Bold(true).Render("◆ " + parts[0])
+	if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+		out += "\n" + styleDim.Render(parts[1])
+	}
+	m.print(out)
+}
+
 func (m *Model) Init() tea.Cmd {
-	// 启动横幅：第一行是身份（◆ 名字 · 模型 · 工具），常驻在转录的最顶上；
-	// 之后的行是提示。内容由 main.go 组装，这里只负责配色。
-	//
 	// **先横幅、后历史**：横幅是"这是哪次启动"，历史是"上次聊了什么"，
 	// 反过来看会以为横幅是历史的一部分。m.print 是同步写转录的，顺序可控。
-	if m.opts.StartupNotice != "" {
-		parts := strings.SplitN(m.opts.StartupNotice, "\n", 2)
-		out := styleAccent.Bold(true).Render("◆ " + parts[0])
-		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
-			out += "\n" + styleDim.Render(parts[1])
-		}
-		m.print(out)
-	}
+	m.printBanner()
 
 	// 恢复出来的历史**不在这里**回放：此时窗口宽度还不知道，
 	// 折行会退回 20 列的兜底值（实测表现是"历史挤在左边一条窄栏"）。
@@ -493,10 +504,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.print(styleErr.Render("✗ " + msg.title + "：" + msg.err.Error()))
 		}
 		return m, m.print(styleBold.Render(msg.title) + "\n" + wrapText(msg.body, m.contentWidth()))
-
-	case resetView:
-		m.resetViewState()
-		return m, tea.ClearScreen
 	}
 	return m, nil
 }
@@ -651,10 +658,10 @@ func (m *Model) View() tea.View {
 		filesLines := m.filesPaneLines(max(fw-2, 1))
 		m.filesTotal = len(filesLines)
 		left := m.renderPane(
-			paneViewport(sessLines, m.sessionsScroll, sw-1, m.height),
+			paneViewport(sessLines, m.sessionsScroll, sw-1, m.height, sessionListTop),
 			sw-1, m.height, borderRight)
 		right := m.renderPane(
-			paneViewport(filesLines, m.filesScroll, fw-1, m.height),
+			paneViewport(filesLines, m.filesScroll, fw-1, m.height, paneListTop),
 			fw-1, m.height, borderLeft)
 		body := padBlock(center, bw, m.height)
 		screen = lipgloss.JoinHorizontal(lipgloss.Top, left, body, right)
@@ -899,6 +906,14 @@ func (m *Model) handleEvent(e event) (tea.Model, tea.Cmd) {
 		return m, m.print(styleDim.Render(approvalRuleText(e.rule)))
 
 	case evDone:
+		// 任务收尾时会话已落盘（Save 在 RunFunc 的包装里、evDone 发出之前）：
+		// 左栏的会话列表在这里同步——轮数、排序、当前标记都变了。
+		// 之前只在窗口 resize 时刷新，一轮对话结束后列表还停在启动时的样子
+		//（实测：状态行已经"会话 1 轮"，左栏还是 Sessions 0）。
+		m.refreshSessions()
+		// 右栏同理，而且更常见：agent 的产物就是文件（体检报告写进 reports\
+		// 是最典型的路径），一轮跑完右栏应当立刻看得到。
+		m.refreshFiles()
 		return m.finish(e)
 	}
 	return m, nil
@@ -1199,6 +1214,7 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 
 	m.input.SetValue("")
 	m.remember(text)
+	m.deletePendingID = "" // 发了消息=意图变了，取消待确认的删除
 
 	if m.st == stateRunning {
 		// 运行中提交：排队，等当前任务结束自动接上。
