@@ -71,6 +71,23 @@ func TestValidateRequiresAllProviderFields(t *testing.T) {
 	}
 }
 
+// 全空时三个字段必须**同时**出现在报错里。
+//
+// 半成品配置（上次编辑到一半退出）最常见的就是缺好几项；一次说全，
+// 用户才不用"修一个、跑一趟"地来回试错。
+func TestValidateReportsAllMissingAtOnce(t *testing.T) {
+	cfg := Config{} // 先赋给变量：Validate 是指针方法，字面量不可寻址
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, f := range []string{"baseUrl", "apiKey", "model"} {
+		if !strings.Contains(err.Error(), f) {
+			t.Fatalf("报错应同时列出缺失的 %s：%v", f, err)
+		}
+	}
+}
+
 func TestRedact(t *testing.T) {
 	cases := map[string]string{
 		"":                "(unset)",

@@ -9,13 +9,49 @@
 外加一个把它们一次跑完并落报告的**聚合服务**——在真机或模拟器上采集数据，
 再把"指标 → 现象 → 原因 → 优化建议"整理成报告。
 
-交付形态只有这两个；`arkperf <任务>` 那种一次性执行是**开发期验证入口**
-（不接续会话、不留历史，见下面「快速开始」的说明），不是第三个产品形态。
+性能测量能力全部来自本仓库的 `mcp-servers/`（标准库之外只依赖 `mcp` 一个包）。
+Release 包里已带便携 Python，解压即用；从源码运行才需要自己装。
 
-性能测量能力全部来自本仓库的 `mcp-servers/`，因此**跑起来需要先把 Python 依赖装好**
-（标准库之外只依赖 `mcp` 一个包）。
+## 快速开始
 
-## 环境要求
+**只需要 Windows 10 / 11（64 位）**。要连真机或模拟器采集数据才需要 DevEco Studio，
+只看界面、跑工具不需要。
+
+1. 从 [Releases](https://github.com/fan-weibo/ArkPerf/releases) 下载
+   `ArkPerf-<版本>-windows-x64.zip`，**完整解压**到任意目录。
+
+2. 生成配置：
+
+   ```bash
+   arkperf.exe init
+   ```
+
+   它会打印解析到的 MCP 目录与 Python 解释器（都在解压目录里），并生成
+   `%USERPROFILE%\.arkperf\config.json`。重复运行不会覆盖已填的内容；
+   配置没填完时它会直接列出缺哪几项。
+
+3. 填模型信息——编辑上面那个 `config.json` 的 provider 段：
+   `baseUrl`（OpenAI 兼容端点）/ `apiKey` / `model`。
+
+4. 自检：
+
+   ```bash
+   arkperf.exe check     # 工具链：hdc / hvigorw / ohpm / node / java
+   arkperf.exe mcp       # 应输出 5/5 服务器已连接 · 13 个工具
+   ```
+
+   `arkperf mcp` 那一步是分界线：**5/5 才算装好了**。某一个连不上不影响其余几个，
+   报错会说明原因。
+
+5. 使用：
+
+   ```bash
+   arkperf.exe tui
+   ```
+
+   建议把 arkperf.exe 所在目录加入 PATH 环境变量，便于使用。
+
+## 从源码构建与运行
 
 | 依赖                  | 用途                            | 参考版本                             |
 | --------------------- | ------------------------------- | ------------------------------------ |
@@ -25,7 +61,7 @@
 | Node + pnpm           | 仅构建桌面端时需要              | 22 / pnpm 12                         |
 | `wails3` CLI          | 仅构建桌面端时需要              | 3.0.0-beta.25                        |
 
-### 没装 Go？先装它
+### Go 环境配置
 
 ```bash
 winget install GoLang.Go     # Windows
@@ -33,38 +69,17 @@ brew install go              # macOS
 # 其他平台：https://go.dev/dl/
 ```
 
-装完 `go version` 应 ≥ **1.26.5**。1.27 也能用（已核对：本项目没用 1.27 里会变行为的那几处 API）。
+装完 `go version` 应 ≥ **1.26.5**。
 
-### 国内网络：建议先配代理 / 镜像
-
-不是必须，但校园网、公司网下能省掉一堆超时。**这两个都只影响"第一次拉依赖"**：
-
-```bash
-# Go 模块代理：第一次 go build 要拉几十个模块（Wails、bubbletea 等），
-# 默认走 proxy.golang.org，国内经常卡住或超时
-go env -w GOPROXY=https://goproxy.cn,direct
-
-# pip 镜像：装 mcp 包时用（写法见下面第 1 步的注释）
-```
-
-核对是否生效：`go env GOPROXY`、`pip config list`。
-
-## 快速开始
+### 步骤
 
 ```bash
 # 1) 装测量服务的 Python 依赖（在仓库根建虚拟环境，之后会被自动识别）
 python -m venv .venv
-.venv\Scripts\pip install mcp            # macOS / Linux: .venv/bin/pip install mcp
-#    校园网 / 公司网络下访问 pypi.org 慢或连不上时，改用镜像（一次性指定即可）：
-#      .venv\Scripts\pip install -i https://pypi.tuna.tsinghua.edu.cn/simple mcp
+.venv\Scripts\pip install mcp
 
 # 2) 生成配置（写 ~/.arkperf/config.json）
 go run ./cmd/arkperf init
-#    它会打印解析到的 MCP 目录与 Python 解释器，并对缺失项给出提示。
-#    没找对时用环境变量指定：
-#      Windows:      set ARKPERF_PYTHON=<python.exe 绝对路径>
-#      macOS/Linux:  export ARKPERF_PYTHON=<python 绝对路径>
-#    MCP 目录被挪走时同理：ARKPERF_MCP_DIR
 
 # 3) 填模型 API Key
 #    编辑 ~/.arkperf/config.json 的 provider.baseUrl / apiKey / model
@@ -73,15 +88,8 @@ go run ./cmd/arkperf init
 go run ./cmd/arkperf check        # 工具链：hdc / hvigorw / ohpm / node / java
 go run ./cmd/arkperf mcp          # 应输出：5/5 服务器已连接 · 13 个工具
 
-# 5) 用起来
-go run ./cmd/arkperf tui          # TUI（交付形态之一；键位与命令见表下）
-#    进去之后发一句话就能跑完整体检，例如：
-#      "对 com.example.perfapp 做一次完整体验体检，归档报告"
-#    四类指标全采完会落一份报告到 <工作区>/reports/（见下面的说明）
-
-# 头两个子命令是开发期验证入口，不是产品形态：一次性跑完就退出、不留会话历史
-go run ./cmd/arkperf "分析 com.example.app 的冷启动耗时"   # 一次性执行
-go run ./cmd/arkperf tool grep '{"pattern":"TODO","glob":"*.go"}'   # 直接调单个工具
+# 5) 使用
+go run ./cmd/arkperf tui          # TUI；进入后 /help 看全部命令与按键
 
 # 其余是自检/查看类子命令
 go run ./cmd/arkperf tools        # 工具清单（含审批标注）
@@ -92,34 +100,8 @@ go test ./...                     # 全量测试（497 顶层 + 143 子测试）
 ```
 
 > 注意：`arkperf` **不带参数只会打印帮助**，交互式界面要写 `arkperf tui`。
-> 一次性执行**不接续会话历史**：每次都是全新上下文，也不会把这次对话存进侧栏——
-> 它定位是"脚本化/回归验证"，要多轮与历史回放请用 TUI 或桌面端。
->
-> 进入 TUI 后按 **`/help`** 可列出全部命令与按键（命令表与补全菜单同源，不会出现"help 里写了但没有"）。
->
-> **界面是三栏**：左 = 当前工作区的会话，中 = 对话，右 = 工作区文件树。
-> 终端窄于 124 列会自动让位：**先省掉右栏，再窄就整个退回单栏**；拉宽即自动恢复。
-> 栏宽也可以直接**拖分隔线**调，**双击**那条线复位。
->
-> 常用键：`Enter` 发送 · `Ctrl+J` 换行 · `Esc` 中断 · `PgUp/PgDn` 回看历史 ·
-> `Ctrl+O` 会话列表（弹窗切换） · `Ctrl+T` 切换主题（内置 5 套） ·
-> `Ctrl+B` / `Ctrl+E` 折叠左栏 / 右栏。
->
-> 鼠标：点左栏的会话即切换 · 点右栏的目录展开折叠、点文件名把相对路径写进输入框 ·
-> 转录超过一屏时右缘出现滚动条，**可点也可拖**。
->
-> 斜杠命令：`/sessions` 列出并切换本工作区的会话 · `/new` 新会话（清上下文并清屏） ·
-> `/yes` 切自动批准 · `/skills` 技能清单 · `/rules` 审批规则。
 
-顺带说清最难找的东西——**报告落在哪**：体检报告写进
-`<工作区>/reports/report-<时间>-<tag>.md`（同名 `.json`，目录自动创建）。
-tag 用 `baseline` / `optimized` 这类固定词：优化前后各跑一次，两份报告并排躺在同一个
-`reports/` 里，靠 tag 认出哪份是基线。
-
-`arkperf mcp` 那一步是分界线：**5/5 才算装好了**。某一个连不上不影响其余几个，
-报错里会给出具体是哪个服务、什么原因（常见原因：python 里没装 `mcp` 包）。
-
-## 桌面端（可选）
+## 桌面端（暂不推荐，需要者自行构建完善）
 
 ```bash
 # 还没装 wails3 CLI 时（版本要与 go.mod 里的 wails 一致）
@@ -150,8 +132,6 @@ desktop/                桌面端外壳（Wails3 + Vue3）
 mcp-servers/            5 个 Python 服务：四类指标采集 + 一个聚合出报告
 skills/                 内置技能：与 mcp-servers/ 平级的随仓库分发数据
 ```
-
-（本仓库另有一个不进版本库的 `docs/`，放内部工作记录；克隆下来看不到它。）
 
 ## 技能（skill）
 
@@ -221,11 +201,11 @@ CLI 加 `--yes`（后者是全自动批准，不落规则）。
 
 MCP 目录、Python 解释器与技能目录**不写死在代码里**，按以下顺序解析：
 
-| 目标         | 解析顺序                                                                                        |
-| ------------ | ----------------------------------------------------------------------------------------------- |
-| MCP 目录     | `ARKPERF_MCP_DIR` → 可执行文件所在目录及其上两级下的 `mcp-servers` → 当前目录下的 `mcp-servers` |
-| Python       | `ARKPERF_PYTHON` → 仓库根或 `mcp-servers` 下的 `.venv` → PATH 上的 `python` / `python3` / `py`  |
-| 内置技能目录 | `ARKPERF_SKILLS_DIR` → 可执行文件所在目录及其上两级下的 `skills` → 当前目录下的 `skills`        |
+| 目标         | 解析顺序                                                                                                                                                |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| MCP 目录     | `ARKPERF_MCP_DIR` → 可执行文件所在目录及其上两级下的 `mcp-servers` → 当前目录下的 `mcp-servers`                                                         |
+| Python       | `ARKPERF_PYTHON` → **可执行文件同级的 `python\python.exe`（发布包内置）** → 仓库根或 `mcp-servers` 下的 `.venv` → PATH 上的 `python` / `python3` / `py` |
+| 内置技能目录 | `ARKPERF_SKILLS_DIR` → 可执行文件所在目录及其上两级下的 `skills` → 当前目录下的 `skills`                                                                |
 
 解析结果会在 `arkperf init` 时打印出来；连不上 MCP 时先看那两行，
 技能没加载到就 `arkperf skills` 看它找了哪三个目录。

@@ -85,6 +85,19 @@ type Conn struct {
 // 桌面端从 exe 目录启动，工作区却是用户选的那个目录，于是工具里的相对路径
 // （典型是报告输出目录）会落到 exe 旁边，而不是用户以为的工程里。
 //
+// pythonScript 从参数里找出 .py 脚本路径；找不到则返回空串。
+//
+// 扫一遍参数而不是只看第一个：服务配置可能是 `python x_server.py`，
+// 也可能是 `python -u x_server.py`。
+func pythonScript(args []string) string {
+	for _, a := range args {
+		if strings.HasSuffix(strings.ToLower(a), ".py") {
+			return a
+		}
+	}
+	return ""
+}
+
 // 握手失败时会把子进程的 stderr 尾巴拼进错误：Python 服务的启动失败
 // （缺包、路径错、解释器不对）几乎全靠这段输出才能定位。
 func Connect(ctx context.Context, name string, cfg ServerConfig, dir string) (*Conn, error) {
@@ -103,6 +116,24 @@ func Connect(ctx context.Context, name string, cfg ServerConfig, dir string) (*C
 	// 不关掉缓冲，客户端会一直等一条永远不 flush 的响应——表现为"握手卡死"，
 	// 且没有任何报错。这是接 Python MCP 服务器最常见的坑。
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1", "PYTHONIOENCODING=utf-8")
+
+	// 把脚本所在目录显式加进 PYTHONPATH —— **仅对普通解释器生效**。
+	//
+	// 背景：发布包用便携 Python（官方 embeddable 版），它带 ._pth 文件——
+	// ._pth 存在时 sys.path 完全由文件内容决定，**PYTHONPATH 被直接忽略**，
+	// 脚本目录也不再加入。所以打出来的包里 `import jank_core`（同目录兄弟模块）
+	// 会失败（0/5 服务器已连接）。**真正修它的是 package.ps1 往 ._pth 里补的
+	// ..\mcp-servers 条目，这里这段对 embeddable 不起作用。**
+	//
+	// 保留是因为其他解释器变体（conda 打包、Windows Store 版等）行为各异，
+	// 显式设上至少保证普通解释器下行为一致。
+	if script := pythonScript(cfg.Args); script != "" {
+		dir := filepath.Dir(script)
+		if old := os.Getenv("PYTHONPATH"); old != "" {
+			dir += string(os.PathListSeparator) + old
+		}
+		cmd.Env = append(cmd.Env, "PYTHONPATH="+dir)
+	}
 	for k, v := range cfg.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

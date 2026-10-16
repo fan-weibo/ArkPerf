@@ -218,6 +218,16 @@ func initCmd() *cobra.Command {
 			path := kernel.ConfigPath()
 			if _, err := os.Stat(path); err == nil {
 				fmt.Fprintf(cmd.OutOrStdout(), "已存在：%s\n", path)
+				// 顺手做个体检。跑第二次 init 的最常见原因就是"上次编辑到
+				// 一半退出了"——只说"已存在"会白白错过给行动指引的机会。
+				// 只读不改：配置填没填完整都不动文件。
+				if cfg, loadErr := kernel.Load(path); loadErr == nil {
+					if verr := cfg.Validate(); verr != nil {
+						fmt.Fprintf(cmd.OutOrStdout(), "⚠ %v\n", verr)
+					} else {
+						fmt.Fprintln(cmd.OutOrStdout(), "配置完整。查看详情：arkperf config")
+					}
+				}
 				return nil
 			}
 

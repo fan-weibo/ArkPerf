@@ -113,15 +113,26 @@ func Load(path string) (*Config, error) {
 }
 
 // Validate 校验必填项，缺失即明确报错（不要带着空值去发请求）。
+// Validate 校验必填配置。
+//
+// **一次报出全部缺失项**，而不是碰到第一个就返回：半成品配置（上次编辑到
+// 一半退出）最常见的状态就是同时缺好几项，一次说全，用户才不用
+// "修一个、跑一趟"地来回试错。
 func (c *Config) Validate() error {
+	var missing []string
 	if c.Provider.BaseURL == "" {
-		return errors.New("provider.baseUrl is empty (edit ~/.arkperf/config.json or set ARKPERF_BASE_URL)")
+		missing = append(missing, "provider.baseUrl")
 	}
 	if c.Provider.APIKey == "" {
-		return errors.New("provider.apiKey is empty (edit ~/.arkperf/config.json or set ARKPERF_API_KEY)")
+		missing = append(missing, "provider.apiKey")
 	}
 	if c.Provider.Model == "" {
-		return errors.New("provider.model is empty (edit ~/.arkperf/config.json or set ARKPERF_MODEL)")
+		missing = append(missing, "provider.model")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"配置缺失：%s（编辑 %s 填上，或设环境变量 ARKPERF_BASE_URL / ARKPERF_API_KEY / ARKPERF_MODEL）",
+			strings.Join(missing, "、"), ConfigPath())
 	}
 	for name, srv := range c.MCPServers {
 		if srv.IsEnabled() && strings.TrimSpace(srv.Command) == "" {

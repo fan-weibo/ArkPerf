@@ -86,3 +86,16 @@ docs/
 generate_icons.py
 icon-concept-02-a-scan.png
 desktop/build/icons_png/
+
+# ---- 发布包与打包缓存 ----
+# dist\ 是 package.ps1 的产物（ArkPerf-<版本>-windows-x64.zip 与解包目录），
+# 每次发版重新生成，属于构建产物；Releases 附件在 GitHub 上，不该进仓库。
+# .cache\ 是打包脚本下载的 Python embeddable / get-pip.py 缓存，
+# 本机可随时重建，而且不同人缓存的东西不必一致。
+dist/
+.cache/
+
+# 打包脚本本身也不进仓库：这是作者本机的发布流程，不是项目的一部分。
+# 注意：忽略后它只存在于本机工作区，重克隆/换机器会丢——
+# 需要时从 Releases 的旧附件或作者处拿。
+package.ps1

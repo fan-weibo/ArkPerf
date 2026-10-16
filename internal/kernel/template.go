@@ -75,9 +75,20 @@ func ResolveMCPDir() string {
 }
 
 // ResolvePython 解析跑 MCP 服务要用的 python 解释器路径。
+//
+// 顺序（先命中先用）：
+//  1. ARKPERF_PYTHON —— 显式指定，最高优先级
+//  2. 可执行文件同级的 python/ —— 随发布包分发的便携解释器
+//  3. 仓库根 / mcp-servers 下的 .venv —— 在源码目录里开发时
+//  4. PATH 上的 python / python3 / py —— 兜底
 func ResolvePython(mcpDir string) string {
 	if v := os.Getenv("ARKPERF_PYTHON"); v != "" {
 		return v
+	}
+	// 便携解释器排在 .venv 之前：**程序自带的**应当优先于**环境里碰巧有的**。
+	// 发布包里只有前者；源码目录里只有后者，两者不会同时存在。
+	if p := portablePython(); p != "" {
+		return p
 	}
 	// 仓库根与 mcp-servers 下的 .venv，Windows 与类 Unix 两种布局都试
 	bases := []string{filepath.Dir(mcpDir), mcpDir}
@@ -98,6 +109,31 @@ func ResolvePython(mcpDir string) string {
 	}
 	// 交给连接时的报错去说明（不去 panic，理由同 ResolveMCPDir）
 	return "python"
+}
+
+// portablePython 返回随发布包分发的便携解释器路径；没有则返回空串。
+//
+// 便携版（官方 embeddable package）是一个自带标准库的独立解释器副本，
+// 解压即用、不写注册表、不依赖用户机器上装了什么——这就是"下载就能跑"
+// 的全部来源。它就在 exe 旁边，所以只需要看同级目录。
+func portablePython() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	// Windows 用 python/python.exe；类 Unix 布局是 python/bin/python3
+	for _, rel := range []string{
+		filepath.Join("python", "python.exe"),
+		filepath.Join("python", "bin", "python3"),
+		filepath.Join("python", "bin", "python"),
+	} {
+		cand := filepath.Join(dir, rel)
+		if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+			return cand
+		}
+	}
+	return ""
 }
 
 // TemplatePaths 是模板解析出来的两条路径，供调用方打印 / 自检。
