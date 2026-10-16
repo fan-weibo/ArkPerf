@@ -1,12 +1,26 @@
 // Package tui 是 ArkPerf 的终端交互前端（Bubble Tea v2）。
 //
-// 布局采用 alt-screen 整屏：转录在上方视口（PageUp/PageDown 回看），
-// 底部是活区（运行指示 + 输入框 + 状态行），永远钉在屏幕底边。
-// 这样"输入框沉底、agent 名字常驻左上"成立；鼠标划选仍交给终端，
-// 所以复制不受影响。
+// 布局采用 alt-screen 整屏，终端够宽时分三栏：
+//
+//	┌──────────┬────────────────────────┬──────────┐
+//	│ 会话列表 │ 转录视口（上方）        │ 文件树   │
+//	│ 左栏     │ 活区：输入框（底部）    │ 右栏     │
+//	└──────────┴────────────────────────┴──────────┘
+//
+// 中间栏是正文：转录在上方视口（PageUp/PageDown 回看），底部是活区
+// （运行指示 + 输入框 + 状态行）永远钉在屏幕底边——"输入框沉底、
+// agent 名字常驻"这两点在三栏下仍然成立。
+//
+// 终端窄于 panes.go 的 minPanesW 时整体退回单栏：硬塞侧栏只会让正文
+// 窄到没法读。左右栏都可折叠（点各自的标题行，或 Ctrl+B / Ctrl+E），
+// 折叠后留一条可点击的窄条，所以随时能拉回来——不留窄条的话，
+// 折叠之后就没有任何入口能把它重新打开了。
+//
+// 栏宽决策集中在 panes.go 的 columns() 一处，正文宽度只有一个来源。
 //
 // 所有外部依赖都从 Options 注入：TUI 自己不去读配置、不去连 MCP、
-// 不去探测工具链。这样它既容易测（塞假执行器即可），也不跟内核耦合。
+// 不去探测工具链、也不遍历文件系统。这样它既容易测（塞假执行器即可），
+// 也不跟内核耦合。
 package tui
 
 import (
@@ -44,7 +58,7 @@ type Options struct {
 	//
 	// 与上面两个同样是注入的闭包：TUI 既不知道 app、也不 import skill，
 	// 它只需要一段能直接打印的文本。用闭包而不是固定值，是因为工作目录
-	// 会随 /cd 变化，而项目级技能就挂在 <工作目录>/.arkperf/skills 下。
+	// 会随跨工作区的会话切换而变，而项目级技能就挂在 <工作目录>/.arkperf/skills 下。
 	SkillReport func() string
 	// SkillSummary 是一行技能摘要（如 "技能 3 个 · 内置 3"），供状态行与 /status。
 	SkillSummary func() string
@@ -71,11 +85,6 @@ type Options struct {
 	// 跨工作区的会话要连工作区一起切过去，返回的目录供状态行更新——
 	// 否则屏幕上写着旧目录、模型却在另一个目录里干活。
 	OpenSession func(id string) ([]ReplayLine, string, error)
-	// SwitchWorkspace 切换工作目录（工作区），返回切换后的目录（/cd）。
-	//
-	// 由调用方注入：TUI 自己不去读配置、不碰 app.Session。
-	// 切换后该目录的最近会话要一并接上——那是装配层的事，TUI 只负责说清楚。
-	SwitchWorkspace func(path string) (string, error)
 	// StartupNotice 在进入界面时先打进转录（例如"已恢复上次会话"）。
 	StartupNotice string
 	// InitialReplay 是启动时要回放的历史（恢复上次会话时填）。
@@ -83,6 +92,14 @@ type Options struct {
 	// 必须填：光有"已恢复上次会话"的提示、屏幕却空着，
 	// 用户会以为数据丢了（实测被当场问到）。顺序是横幅在前、历史在后。
 	InitialReplay []ReplayLine
+
+	// ListFiles 列出当前工作区的文件树（右栏）。
+	//
+	// 与 Sessions 同一条理由：TUI 不 import app，也不自己遍历文件系统。
+	// 遍历的深度、节点上限、要跳过的目录（.git / node_modules / dist…）
+	// 都由调用方决定——那些是策略，不是界面的事。
+	// 返回 nil 表示不提供文件树（右栏显示"未提供"而不是空白）。
+	ListFiles func() []FileNode
 }
 
 // SessionBrief 是会话列表里的一项（由调用方从 app 层映射而来）。
@@ -92,6 +109,18 @@ type SessionBrief struct {
 	Turns   int
 	Updated string
 	Current bool
+}
+
+// FileNode 是文件树里的一个节点（左栏会话列表的同级结构，供右栏用）。
+//
+// Path 是**相对工作区**的路径，同时也是折叠状态的键与"点击插入输入框"的内容。
+// 用相对路径而不是绝对路径：绝对路径在窄栏里会被截掉最有信息量的尾部，
+// 而且插进输入框时用户要的通常是相对路径。
+type FileNode struct {
+	Name     string
+	Path     string
+	IsDir    bool
+	Children []FileNode
 }
 
 // ReplayLine 是回放的一行。Role 决定渲染方式，与实时事件一一对应：

@@ -27,6 +27,12 @@ type Session struct {
 	// 不做成单独的索引文件而放进会话本身：改名跟着会话走，
 	// 删掉会话名字自然也没了，不会留下指向已删除会话的悬空条目。
 	Title string `json:"title,omitzero"`
+
+	// savedLen 是上次落盘时的消息条数。
+	//
+	// 只回答一个问题：这次 Save 是"对话推进了"还是"仅仅被切过来看了一眼"。
+	// 不序列化——它是内存里的判断依据，写进文件会在下次读出来时过期。
+	savedLen int
 }
 
 // Rename 给会话起名。空串表示清除自定义名（回到自动标题）。
@@ -123,7 +129,19 @@ func (s *SessionStore) Save(sess *Session) error {
 	if err := os.MkdirAll(s.Dir(), 0o755); err != nil {
 		return err
 	}
-	sess.Updated = time.Now()
+
+	// 只在**消息有推进**时刷新 Updated。
+	//
+	// 原来是无条件刷新，但切换会话也会走 Save（见 app 层的 OpenSession）——
+	// 于是侧栏显示的时间变成了"你上次点开它的时间"，而不是"上次对话的时间"。
+	// 按条数判断足够：对话推进会追加消息，单纯切换不会。
+	//
+	// 改名（Rename）自己会设 Updated，不走这里；空会话（还没聊过）也不刷新，
+	// 它的时间是创建时间，那才是对的。
+	if len(sess.Messages) != sess.savedLen {
+		sess.Updated = time.Now()
+	}
+	sess.savedLen = len(sess.Messages)
 
 	b, err := json.Marshal(sess)
 	if err != nil {
@@ -147,6 +165,9 @@ func (s *SessionStore) Load(id string) (*Session, error) {
 	if err := json.Unmarshal(b, &sess); err != nil {
 		return nil, fmt.Errorf("会话 %s 解析失败: %w", id, err)
 	}
+	// 记下读出来的条数：这样"读出来紧接着 Save 一次"（切会话就是这条路径）
+	// 不会被误判成消息有推进。List() 也走这里，所以两条读取路径都覆盖到了。
+	sess.savedLen = len(sess.Messages)
 	return &sess, nil
 }
 

@@ -39,7 +39,6 @@ func commands() []SlashCommand {
 		{Name: "status", Help: "显示当前装配状态", Run: cmdStatus},
 		{Name: "new", Help: "开始新会话（清空上下文与屏幕）", Run: cmdNew},
 		{Name: "sessions", Help: "列出当前工作区的会话；/sessions <序号> 切过去", Run: cmdSessions},
-		{Name: "cd", Help: "切换工作目录（工作区，会换成该目录的会话）", Run: cmdCd},
 		{Name: "clear", Help: "清空屏幕上的转录（不影响上下文）", Run: cmdClear},
 		{Name: "mouse", Help: "切换鼠标捕获：开=滚轮+内置选中，关=交还终端原生划选", Run: cmdMouse},
 		{Name: "exit", Help: "退出 TUI", Run: cmdExit},
@@ -93,6 +92,7 @@ func cmdHelp(m *Model, _ string) tea.Cmd {
 		styleDim.Render("  ⏎ 发送任务　Ctrl+J / Alt+⏎ 换行　Ctrl+P / Ctrl+N 翻历史"),
 		styleDim.Render("  Esc 运行中=中断、空闲=清空输入　Tab 补全命令"),
 		styleDim.Render("  Ctrl+C 有选区=复制、否则运行中=中断/空闲=退出　Ctrl+Insert 只复制"),
+		styleDim.Render("  Ctrl+B / Ctrl+E 折叠、展开左侧栏（会话）/ 右侧栏（文件）"),
 		"",
 		styleBold.Render("会话"),
 		styleDim.Render("  · 同一界面里是多轮对话：模型能看到之前几轮说过的话与工具结果"),
@@ -101,7 +101,8 @@ func cmdHelp(m *Model, _ string) tea.Cmd {
 		styleDim.Render("  · /clear 只清屏幕，不影响模型的上下文；要清上下文用 /new"),
 		"",
 		styleBold.Render("说明"),
-		styleDim.Render("  · 全屏布局：转录在上方视口，输入框钉在屏幕底边"),
+		styleDim.Render("  · 三栏布局：左=当前工作区会话，中=对话，右=工作区文件树"),
+		styleDim.Render("  · 终端窄于 120 列时自动退回单栏；点右栏文件名可把相对路径插进输入框"),
 		styleDim.Render("  · PageUp / PageDown 或滚轮回看历史；左键拖拽选中文字，Ctrl+C 复制"),
 		styleDim.Render("  · 回看时视口不会被新输出拽回底部，滚到最底才恢复跟随最新"),
 		styleDim.Render("  · 运行中提交的任务会排队，当前任务结束后自动开始"),
@@ -230,7 +231,7 @@ func cmdStatus(m *Model, _ string) tea.Cmd {
 //
 // **屏幕一起清掉**。旧版留着上一段对话，理由是"那是历史记录"——
 // 但用户的心智是"我开了个新会话"：屏幕还挂着旧对话就不像新的，
-// 也容易出现"屏幕上写着 A、模型手里是空的"这种错位（与 /cd 同一条原则）。
+// 也容易出现"屏幕上写着 A、模型手里是空的"这种错位。
 // 旧会话并没有丢：每轮任务结束都落过盘，可以用 /sessions 切回去。
 func cmdNew(m *Model, _ string) tea.Cmd {
 	if m.opts.ResetSession == nil {
@@ -305,35 +306,14 @@ func cmdClear(m *Model, _ string) tea.Cmd {
 	return func() tea.Msg { return resetView{} }
 }
 
-// cmdCd 切换工作目录（工作区）。
+// /cd（在 TUI 内切换工作区）已移除。
 //
-// 换目录＝换项目：模型上下文随之换成那个目录自己的最近会话（装配层负责接上）。
-// **屏幕必须一起清掉**——否则会出现"屏幕上是 A 项目的对话，模型却拿着 B 项目的
-// 历史在干活"这种最危险的错位。这与 /new、/clear 的取舍是同一条原则：
-// 任何时候都别让屏幕显示的东西和模型实际持有的东西不一致。
-func cmdCd(m *Model, arg string) tea.Cmd {
-	dir := strings.TrimSpace(arg)
-	if dir == "" {
-		return m.print(styleDim.Render("用法：/cd <目录>") + "\n" +
-			styleDim.Render("  当前工作目录："+m.opts.CWD))
-	}
-	if m.opts.SwitchWorkspace == nil {
-		return m.print(styleDim.Render("（当前不支持切换工作目录）"))
-	}
-
-	next, err := m.opts.SwitchWorkspace(dir)
-	if err != nil {
-		return m.print(styleErr.Render("✗ 切换失败：" + err.Error()))
-	}
-
-	m.opts.CWD = next // 状态行与 /status 显示的目录要跟着变
-	// 同步清屏（不用 tea.Batch：并发跑"清屏"与"打印说明"的顺序是不保证的，
-	// 说明有可能被自己清掉），再把说明放进清空后的屏幕
-	m.resetViewState()
-	return m.print(styleWarn.Render("已切换工作目录："+next) + "\n" +
-		styleDim.Render("上下文已换成该目录的最近会话（屏幕一并清空，避免与上下文错位）；"+
-			"/status 看会话规模，/new 开始新会话"))
-}
+// 换工作区现在只有两条路：换目录再启动，或者切到别的目录的会话
+//（openSessionIdx 会把 CWD 一起跟过去）。保留一个能从界面里改工作区的命令，
+// 等于给"屏幕显示 A、模型拿着 B"这种错位多开一个入口——收益不抵风险，
+// 而且它要求整屏清空，本来就与"边看边切"的使用方式是冲突的。
+//
+// 装配层的 SetWorkspace 仍在（跨工作区的会话切换依赖它）。
 
 func cmdExit(_ *Model, _ string) tea.Cmd { return tea.Quit }
 

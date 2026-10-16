@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fan-weibo/ArkPerf/internal/kernel"
@@ -147,6 +150,89 @@ type Model struct {
 	// approvalNote 是审批刚过去时要说的一句补充说明
 	// （例如"没有可记忆的类别，只放行了本次"）。
 	approvalNote string
+
+	// ---------------------------------------------------------------- 侧栏
+	// 三栏布局的渲染与命中逻辑在 panes.go，这里只放状态。
+
+	// showSessions / showFiles 是**用户意图**，默认都为 true（默认打开）。
+	//
+	// 终端太窄时 columns() 会忽略它们退回单栏，但意图保留：
+	// 窗口拉宽之后侧栏自动回来，不需要用户再点一次。
+	showSessions bool
+	showFiles    bool
+
+	// sessionsWidth / filesWidth 是用户拖拽后的栏宽（默认见布局常量）。
+	//
+	// 只放在内存里：宽度是"这次窗口下的临时偏好"，不是该跨会话记住的配置——
+	// 换台显示器、换个终端字号，合适的宽度就变了。
+	sessionsWidth int
+	filesWidth    int
+	// dragging 记录正在被拖拽调整宽度的栏；paneDragNone 表示没有。
+	dragging paneDrag
+	// dragOrigin 是拖拽开始时的鼠标列与栏宽，用于按位移换算新宽度。
+	dragOriginX int
+	dragOriginW int
+	// lastBorderClick 记录上一次点边界的时间，用于判断双击复位。
+	lastBorderClick time.Time
+
+	// sessionsScroll / filesScroll 是侧栏的滚动偏移（首行下标）。
+	//
+	// sessionsTotal / filesTotal 是上次渲染时的总行数，用来把滚动
+	// clamp 在有效范围内——没有它的话滚到底之后 offset 会继续增大，
+	// 用户得往回滚很多次画面才动（表现为"滚轮失灵了一阵"）。
+	// 与转录的 lineCount/viewportRows 是同一套做法。
+	sessionsScroll int
+	filesScroll    int
+	sessionsTotal  int
+	filesTotal     int
+
+	// sessionsCache 是左栏的会话列表缓存。
+	// 必须缓存：View 每帧渲染，而 Sessions() 要去读会话目录，
+	// 每帧读一次磁盘的话滚动就会掉帧。
+	sessionsCache []SessionBrief
+	// sessionIdx 是左栏当前高亮项（-1 表示无）。
+	sessionIdx int
+
+	// filesCache 是右栏的文件树缓存；filesRows 是它按当前折叠状态摊平的结果，
+	// 点击映射与渲染共用这一份，避免两处各算一次导致错行。
+	filesCache []FileNode
+	filesRows  []treeLine
+	// collapsedDirs 记录被折叠的目录（键是相对工作区路径）。
+	collapsedDirs map[string]bool
+	// filesDefaulted 标记这棵树有没有按默认策略折叠过。
+	//
+	// 默认策略是"只展开第一层"：全展开会把几十上百行塞进只有几十行的侧栏，
+	// 首屏全是枝叶，反而看不出顶层有哪些目录。只在首次拿到树时应用一次——
+	// 之后刷新（尺寸变化等）不再动它，否则用户手动展开的目录会被反复收回去。
+	filesDefaulted bool
+
+	// panePrefix / paneReset 是"铺栏背景"的转义前缀与重置序列。
+	// 换主题时算一次并缓存——View 每帧都要用，不能每帧现算
+	//（lipgloss 的颜色能力判断有开销）。
+	//
+	// panePrefix 为空表示**不画色块**（终端背景没探到，或色彩能力不足），
+	// 此时分栏完全交给竖分隔线。
+	panePrefix string
+	paneReset  string
+
+	// themeBg 是探测到的终端背景色；nil 表示还没探到。
+	// 它是整套配色的输入——正文灰、边框、表面都从它派生出来。
+	themeBg color.Color
+	// themeName / theme 是当前主题的名字与解析结果。
+	themeName string
+	theme     Theme
+
+	// dialog 是当前打开的模态弹窗；nil 表示没有。
+	dialog *dialog
+
+	// barVisible 记录这一帧转录区有没有画滚动条（命中测试要知道它在哪一列），
+	// barDragging 表示正在用鼠标拖它。
+	barVisible  bool
+	barDragging bool
+
+	// animFrame 是动画帧计数，随 spinner 的 tick 递增（shimmer 用它算高光位置）。
+	// 不单起定时器：已有的 tick 就是现成的时钟，而且只在任务运行时才走。
+	animFrame int
 }
 
 // NewModel 构造 TUI 模型。
@@ -196,10 +282,25 @@ func NewModel(ctx context.Context, o Options, b *Bridge) *Model {
 		streamIdx: -1,
 		// 启动历史推迟到第一个窗口尺寸消息之后再渲染（见该字段的说明）
 		pendingReplay: o.InitialReplay,
+		// 侧栏默认打开。窄终端由 columns() 自动退回单栏，
+		// 但"用户想看到侧栏"这个意图保留：窗口拉宽后自动回来。
+		showSessions: true,
+		showFiles:    true,
+		// 栏宽默认值；用户拖拽边界后会改这两个字段
+		sessionsWidth: paneSessionsW,
+		filesWidth:    paneFilesW,
+		// 起步用默认主题；探到终端背景后 setTheme 会按真实背景重解析
+		themeName: builtinThemes[0].Name,
+		// -1 表示左栏当前没有高亮项。零值 0 会被误读成"第一项被选中"。
+		sessionIdx:    -1,
+		collapsedDirs: map[string]bool{},
 	}
 	if o.NewAgent != nil {
 		m.run = o.NewAgent(b, b.Events())
 	}
+	// 应用起步主题。此时还没探到终端背景，所以只会设配色、不铺色块
+	//（见 setTheme 里关于 panePrefix 的说明）。
+	m.setTheme(m.themeName)
 	return m
 }
 
@@ -222,14 +323,31 @@ func (m *Model) Init() tea.Cmd {
 	// 折行会退回 20 列的兜底值（实测表现是"历史挤在左边一条窄栏"）。
 	// 存起来，等第一个 WindowSizeMsg 到达后再渲染（见 Model.pendingReplay）。
 
-	return m.spinner.Tick
+	// 顺带问一次终端背景色：不是所有终端都会答（管道、部分 tmux 配置、
+	// 老终端），答了才启用背景色块分栏，不答就退回竖线。
+	//
+	// 注意传的是函数值而不是调用结果：v2 里 Cmd 就是 func() Msg，
+	// 与 tea.ClearScreen 同一用法（写 RequestBackgroundColor() 会被求值成
+	// Msg，反而不能当 Cmd 用）。
+	return tea.Batch(m.spinner.Tick, tea.RequestBackgroundColor)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.BackgroundColorMsg:
+		// 终端背景是整套配色的**输入**：正文灰、边框、表面都从它派生。
+		// 探到之后按它重新解析主题；在此之前用的是主题假定的背景。
+		m.themeBg = msg
+		m.setTheme(m.themeName)
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeInput()
+		// 侧栏数据在尺寸确定后再拉：窄终端根本不渲染侧栏，
+		// 提前去读会话目录 / 遍历文件树是白花的开销。
+		m.refreshSessions()
+		m.refreshFiles()
 		// 启动历史等到这一刻再渲染：折行宽度要用真实窗口宽度
 		// （见 Model.pendingReplay 的说明）
 		if m.pendingReplay != nil {
@@ -242,9 +360,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
+		m.animFrame++ // 推进动画帧（shimmer 用它算高光位置）
 		return m, cmd
 
 	case tea.MouseWheelMsg:
+		// 先看滚轮落在哪一栏：侧栏滚自己，正文滚转录。
+		// 不分派的话，在侧栏上滚会滚动转录——用户会觉得"滚错了东西"。
+		if p := m.paneAt(msg.X); p == hitSessions || p == hitFiles {
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				m.scrollPaneBy(p, -wheelLinesPerNotch)
+			case tea.MouseWheelDown:
+				m.scrollPaneBy(p, wheelLinesPerNotch)
+			}
+			return m, nil
+		}
+
 		// alt-screen 里没有原生滚动区，滚轮只能自己处理。
 		// 普通一格滚 3 行；按住 Shift 翻整页（与终端的习惯一致）。
 		step := wheelLinesPerNotch
@@ -262,22 +393,64 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseClickMsg:
-		// 左键按下：在转录区里开始一次拖选。
-		// （右/中键留给终端或后续功能，这里不动。）
-		if msg.Button == tea.MouseLeft && m.inTranscript(msg.X, msg.Y) {
+		// 左键按下。先按栏分派：侧栏上的点击是"选会话/开目录"，
+		// 正文上的点击才是"开始拖选"——不分开的话，点侧栏会在
+		// 转录里凭空划出一段高亮（列坐标被当成了正文列）。
+		if msg.Button != tea.MouseLeft {
+			return m, nil // 右/中键留给终端或后续功能
+		}
+		// 转录区的滚动条优先于正文拖选：它在正文栏的最右一列，
+		// 不先判的话，点它会从内容里划出一段选区。
+		if col := m.scrollbarCol(); col >= 0 && msg.X == col {
+			m.beginScrollbarDrag(msg.Y)
+			return m, nil
+		}
+		switch m.paneAt(msg.X) {
+		case hitSessions:
+			// 落在左栏的右边界上：这是"调宽 / 双击复位"，不是"选会话"。
+			// 不先判边界的话，想拖宽的时候会把会话切走。
+			if msg.X == m.paneBorderCol(paneDragSessions) {
+				m.beginOrResetDrag(paneDragSessions, msg.X)
+				return m, nil
+			}
+			return m.clickSessions(msg.Y)
+		case hitFiles:
+			if msg.X == m.paneBorderCol(paneDragFiles) {
+				m.beginOrResetDrag(paneDragFiles, msg.X)
+				return m, nil
+			}
+			return m.clickFiles(msg.Y)
+		}
+		if m.inTranscript(msg.X, msg.Y) {
 			at := m.transcriptCaret(msg.X, msg.Y)
 			m.sel = selection{active: true, anchor: at, head: at}
 		}
 		return m, nil
 
 	case tea.MouseMotionMsg:
-		// CellMotion 只在按住键时上报移动，所以这就是拖拽：延伸选区。
+		// CellMotion 只在按住键时上报移动，所以这要么是拖拽调宽、要么是拖选。
+		if m.barDragging {
+			m.dragScrollbarTo(msg.Y)
+			return m, nil
+		}
+		if m.dragging != paneDragNone {
+			m.dragTo(msg.X)
+			return m, nil
+		}
 		if m.sel.active {
 			m.sel.head = m.transcriptCaret(msg.X, msg.Y)
 		}
 		return m, nil
 
 	case tea.MouseReleaseMsg:
+		if m.barDragging {
+			m.endScrollbarDrag()
+			return m, nil
+		}
+		if m.dragging != paneDragNone {
+			m.endDrag()
+			return m, nil
+		}
 		// 松手**不复制**：选中只是把内容圈出来，复制留给 Ctrl+C / Ctrl+Insert。
 		// （Reasonix 是松手即复制，但这里按用户要求改成显式复制——
 		// 选完还能反悔、还能接着改选区，不会手一抖就把剪贴板覆盖了。）
@@ -392,10 +565,9 @@ func (m *Model) appendReplay(lines []ReplayLine) {
 
 // resetViewState 清掉屏幕上的转录（不动模型上下文，也不动持久化会话）。
 //
-// 抽成方法是因为有两个入口：`/clear` 经消息异步走到这里，
-// `/cd` 必须**同步**清——它要在同一帧里把"已切换工作目录"这条说明
-// 放进清空后的屏幕。若改用 tea.Batch 去并发跑清屏与打印，
-// 两者的消息顺序是不保证的（说明有可能被自己清掉）。
+// 抽成方法是因为有两个入口：`/clear` 经消息异步走到这里；
+// 切会话（replay）必须**同步**清——它要在同一帧里把回放的内容接在清空之后。
+// 若改用 tea.Batch 去并发跑清屏与回放，两者的消息顺序是不保证的。
 func (m *Model) resetViewState() {
 	m.transcript = nil
 	m.assistantOpen = false
@@ -411,10 +583,18 @@ func (m *Model) resetViewState() {
 // 翻转的代价是回看历史要自己做（PageUp/PageDown），好在转录本来就在内存里。
 func (m *Model) View() tea.View {
 	if m.width <= 0 || m.height <= 0 {
-		// 还没收到窗口尺寸：此时算高度会得到负数
-		return tea.NewView(styleDim.Render("ArkPerf 启动中…"))
+		// 尺寸未知时算高度会得到负数，什么都渲染不了，给空视图。
+		//
+		// 这里**不放**"启动中…"之类的占位文案：退出时 bubbletea 会把尺寸清成 0，
+		// 那一帧的占位会留在用户 shell 里（alt-screen 已经撤了），看起来像又启动了
+		// 一次（实测被问到）。代价是启动那几百毫秒是空白屏，比这个可接受。
+		return tea.NewView("")
 	}
-	w := max(m.width, 24)
+	// 正文宽度：三栏时是中间那一栏，单栏时就是整屏。
+	// 折行、截断、输入框宽度全部以它为准（见 panes.go 的 columns()）——
+	// 这是"三栏之后正文变窄"的唯一落点。
+	sw, bw, fw := m.columns()
+	w := max(bw, 24)
 
 	var parts []string
 	rowsAbove := 0
@@ -450,8 +630,45 @@ func (m *Model) View() tea.View {
 	// 转录视口填满剩余高度：底部区域才能钉在屏幕底边
 	avail := max(m.height-bottomRows, 1)
 	transcript := m.renderTranscript(w, avail)
+	center := strings.Split(transcript+"\n"+bottom, "\n")
 
-	v := tea.NewView(transcript + "\n" + bottom)
+	// 单栏：侧栏完全不参与渲染（窄终端），也就没有列偏移
+	single := sw == 0 && fw == 0
+	leftOffset := 0
+	var screen string
+	if single {
+		// 单栏直接拼、**不补行尾**：内容不满屏时补空格会让每一行后面都拖着
+		// 一串空白（曾因此被用户吐槽"行尾挂着灰方块"）。
+		// 只有多栏才需要补——那是为了把右栏推到固定的列上。
+		screen = strings.Join(center, "\n")
+	} else {
+		leftOffset = sw
+		// 栏宽各减 1 给分隔线：renderPane 返回的总宽恰好等于传入的栏宽，
+		// 三栏加起来正好是终端宽度（多一列就会触发终端自动折行、布局错位）。
+		// 再各减 1 给滚动条列（见 paneViewport）。
+		sessLines := m.sessionsPaneLines(max(sw-2, 1))
+		m.sessionsTotal = len(sessLines)
+		filesLines := m.filesPaneLines(max(fw-2, 1))
+		m.filesTotal = len(filesLines)
+		left := m.renderPane(
+			paneViewport(sessLines, m.sessionsScroll, sw-1, m.height),
+			sw-1, m.height, borderRight)
+		right := m.renderPane(
+			paneViewport(filesLines, m.filesScroll, fw-1, m.height),
+			fw-1, m.height, borderLeft)
+		body := padBlock(center, bw, m.height)
+		screen = lipgloss.JoinHorizontal(lipgloss.Top, left, body, right)
+	}
+
+	// 弹窗最后覆盖：它是模态层，必须在三栏都画完之后再盖上去，
+	// 否则会被后画的正文盖掉一半。
+	if m.dialog != nil {
+		screen = strings.Join(
+			overlayDialog(strings.Split(screen, "\n"), m.dialog.render(m.width), m.width),
+			"\n")
+	}
+
+	v := tea.NewView(screen)
 	v.AltScreen = true
 	// 鼠标模式随 /mouse 切换（学自 Reasonix）：
 	//   · 开捕获（默认）：滚轮/滚动条可用；选中由 app 自己实现——
@@ -465,9 +682,10 @@ func (m *Model) View() tea.View {
 	}
 
 	// 把真实光标钉到插入点：textarea 的坐标是相对自身的，
-	// 需要加上转录区高度、上方占用的行数与边框/内边距。
+	// 需要加上转录区高度、上方占用的行数与边框/内边距，
+	// 三栏时还要加上左栏的列偏移——否则中文输入法的候选窗会飘到侧栏上。
 	if cur := m.input.Cursor(); cur != nil {
-		cur.X += 2                     // 左边框 1 + 左内边距 1
+		cur.X += 2 + leftOffset        // 左边框 1 + 左内边距 1 + 左栏
 		cur.Y += avail + rowsAbove + 1 // 转录区 + 上方行数 + 上边框 1
 		v.Cursor = cur
 	}
@@ -485,7 +703,22 @@ func (m *Model) renderTranscript(w, avail int) string {
 	// 这里曾留一列画竖向滚动指示条（学 Reasonix），但字形是直接拼在行尾的、
 	// 内容行没补齐到整宽，结果每行文字后面都跟着一个灰方块（用户截图吐槽）。
 	// 滚动位置本来就有"回看历史中，下方还有 N 行"那行明示，够用了，直接去掉。
+	// 依据**上一帧**的行数决定要不要留出滚动条那一列。
+	//
+	// 这里有循环依赖：折行宽度取决于这个决定，而这个决定又取决于折行后的行数。
+	// 用上一帧的结果打断它——内容长到刚过一屏时最多差一帧，看不出来。
+	// （另一条路是先按满宽折一遍、再按窄一列重折，结果准确但每帧要折两遍，
+	// 而转录上限是几千行，不值。）
+	//
+	// 动态而不是常驻：常驻会让每一行都多一个行尾字符，而绝大多数时候
+	// 内容根本不满一屏。
 	bodyW := max(w, 8)
+	bar := m.lineCount > avail
+	if bar {
+		bodyW = max(w-1, 8)
+	}
+	// 记下来给命中测试：鼠标得知道那一列在哪儿，才能拖它
+	m.barVisible = bar
 
 	var lines []string
 	for _, entry := range m.transcript {
@@ -518,9 +751,21 @@ func (m *Model) renderTranscript(w, avail int) string {
 
 	// 底部留空（不是顶部）：内容贴着屏幕顶端，输入框钉在底边
 	rows := make([]string, 0, avail)
-	rows = append(rows, window...)
-	for range avail - len(window) {
-		rows = append(rows, "")
+	for i := range avail {
+		s := ""
+		if i < len(window) {
+			s = window[i]
+		}
+		if !bar {
+			// 不留滚动条就**不补行尾**：补了每行后面都拖一片空白，
+			// 那正是当年"行尾挂灰方块"的由来。
+			rows = append(rows, s)
+			continue
+		}
+		// **先补齐到正文宽、再拼滚动条**，滚动条才会全部落在同一列上。
+		// 当年就是漏了这一步（字形直接拼在行尾），于是每行文字后面挂一个方块。
+		rows = append(rows, padTo(s, bodyW)+
+			scrollbarGlyph(i, avail, len(lines), start, m.barDragging))
 	}
 	return strings.Join(rows, "\n")
 }
@@ -816,6 +1061,13 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleApprovalKey(k)
 	}
 
+	// 弹窗也是模态的，打开期间按键只归它。
+	// 必须排在下面的 ctrl+o / ctrl+t 分支之前，否则"再按一次关掉弹窗"
+	// 会变成"又开一次"（看起来就是关不掉）。
+	if m.dialog != nil {
+		return m.handleDialogKey(k)
+	}
+
 	// 有选区时 Ctrl+C / Ctrl+Insert 是"复制"，不是"中断/退出"。
 	//
 	// 必须排在下面的 ctrl+c 分支之前——否则用户拖选完按 Ctrl+C，
@@ -882,6 +1134,24 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+n":
 		m.recallHistory(1)
 		return m, nil
+
+	case "ctrl+b":
+		// 折叠 / 展开左栏（会话），与常见编辑器的侧栏键一致。
+		// 键盘入口必须留着：窄终端里侧栏整个不渲染，那时没有东西可点。
+		return m.toggleSessionsWithNotice()
+
+	case "ctrl+e":
+		// 折叠 / 展开右栏（文件）
+		return m.toggleFilesWithNotice()
+
+	case "ctrl+o":
+		// 会话列表弹窗。左栏已经能点会话了，弹窗的价值是"一眼看全"——
+		// 侧栏一屏放不下十来个会话，弹窗里可以。
+		return m.openSessionDialog()
+
+	case "ctrl+t":
+		// 主题列表弹窗（对齐 opencode 的 dialog-theme-list）
+		return m.openThemeDialog()
 
 	case "tab":
 		if m.slashActive && len(m.slashMatches) > 0 {
@@ -1041,7 +1311,7 @@ func (m *Model) scrollIndicator(w int) string {
 func (m *Model) workingLine(w int) string {
 	// 旋转指示放在输入框上方（Claude Code 同款）：进度在输入区上面，
 	// 快捷键与统计在下面，输入框本身位置固定，不会因为状态变化而跳动。
-	parts := []string{m.spinner.View() + " " + styleDim.Render("运行中")}
+	parts := []string{m.spinner.View() + " " + m.shimmer("运行中")}
 	if m.reasoningChars > 0 {
 		// 思考过程不进转录，但"它在想"必须可见——否则流式刚开始的那几秒
 		// 屏幕看起来像卡住了，而模型其实正在长篇推理。
@@ -1190,10 +1460,23 @@ func (m *Model) slashMenu(w int) string {
 // ---------------------------------------------------------------- 工具方法
 
 // contentWidth 是转录文本可用的宽度（留出一点右边距，避免贴边折行）。
-func (m *Model) contentWidth() int { return max(m.width-2, 20) }
+//
+// 基准是**正文栏宽度**而不是终端宽度：三栏之后正文只占中间那一栏，
+// 仍按终端宽度折行的话每一行都会顶穿右栏。
+//
+// 正文栏本身不足 contentMinW 时把边距从 2 收到 1（对齐 opencode：
+// `width < 44 ? 1 : 2`）——那点边距在 40 列的正文里是 5% 的宽度，
+// 比"看着舒服"重要。
+func (m *Model) contentWidth() int {
+	pad := 2
+	if m.bodyWidth() < contentMinW {
+		pad = 1
+	}
+	return max(m.bodyWidth()-pad, 20)
+}
 
 // boxContentWidth 是输入框内容的宽度：减去边框 2 与内边距 2。
-func (m *Model) boxContentWidth() int { return max(m.width-4, 16) }
+func (m *Model) boxContentWidth() int { return max(m.bodyWidth()-4, 16) }
 
 func (m *Model) resizeInput() {
 	m.input.SetWidth(m.boxContentWidth())
@@ -1289,11 +1572,7 @@ func reasonText(r kernel.StopReason) string {
 	}
 }
 
-// renderAssistant 渲染模型的回答：markdown → 带样式的终端文本。
-// 裸打 markdown 的话 ** 和 “ 全是字面字符（实测被用户吐槽）。
-func renderAssistant(text string, w int) string {
-	return newMarkdownRenderer(w).Render(text)
-}
+// renderAssistant 与 markdown 渲染器已移到 markdown.go（改用 glamour）。
 
 // wrapText 按显示宽度折行（CJK 按 2 列算）。
 func wrapText(s string, w int) string {

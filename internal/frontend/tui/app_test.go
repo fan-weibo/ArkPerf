@@ -172,7 +172,10 @@ func TestAssistantTextGoesToTranscript(t *testing.T) {
 	}
 	h.m.Update(msgs[0])
 
-	if !strings.Contains(h.allTranscript(), "冷启动中位数 320ms") {
+	// 先剥样式再比对：glamour 按文本节点分段渲染，同一句话中间会插转义序列，
+	// 直接 Contains 连续句子会失败——但那是"碎片化"而不是"内容丢了"，
+	// 剥掉样式之后必须连续。
+	if !strings.Contains(ansi.Strip(h.allTranscript()), "冷启动中位数 320ms") {
 		t.Fatalf("模型输出没进转录：%q", h.allTranscript())
 	}
 	if h.m.turns != 1 {
@@ -640,6 +643,10 @@ func TestHistoryRecallWithCtrlPN(t *testing.T) {
 
 func TestViewShowsModeStatusAndHints(t *testing.T) {
 	h := newHarness(t, false)
+	// 用够宽的三栏窗口：状态行本来就长（CWD + 状态 + 会话 + 按键提示），
+	// 窄终端里它会被截断——那是**故意**的（宁可截断也不能顶穿终端宽度），
+	// 但这条用例要验的是"内容有没有写进去"，得给它足够的地方铺开。
+	h.resize(160, 30)
 	content := h.m.View().Content
 
 	// 注意这里是**小写** arkperf：界面里的它是"正在运行的 CLI 名"，
@@ -657,11 +664,16 @@ func TestViewShowsModeStatusAndHints(t *testing.T) {
 	}
 }
 
+// 尺寸未知时给空视图：算高度会得到负数，本来就渲染不了。
+//
+// 这里**故意不**给"启动中…"之类的占位——退出时 bubbletea 会把尺寸清成 0，
+// 那一帧的占位会留在用户 shell 里（alt-screen 已撤），看起来像又启动了一次。
+// 代价是启动那几百毫秒是空白屏，比留下一句假提示可接受。
 func TestViewBeforeWindowSizeIsSafe(t *testing.T) {
 	h := newHarness(t, false)
 	h.m.width, h.m.height = 0, 0
-	if got := h.m.View().Content; got == "" {
-		t.Fatal("尚未收到窗口尺寸时也要有可渲染内容")
+	if got := h.m.View().Content; got != "" {
+		t.Fatalf("尺寸未知时应当给空视图，实得 %q", got)
 	}
 }
 
@@ -1310,4 +1322,20 @@ func TestRenderFrameSnapshot(t *testing.T) {
 		args: map[string]any{"hap": `E:\proj\entry\build\default\outputs\default\entry.hap`}, reply: reply})
 	t.Log("\n--- 审批态 ---\n" + h.m.View().Content)
 	reply <- kernel.ApprovalDeny
+}
+
+// 退出收尾时不能再画出"启动中…"。
+//
+// bubbletea 撤 alt-screen 的那一步会把窗口尺寸清成 0；若此时还按"还没收到
+// 尺寸"处理，占位文案就会被渲染进用户 shell（alt-screen 已经撤了，它会留下来），
+// 看起来像又启动了一次（实测被问到）。
+func TestViewIsBlankAfterTeardown(t *testing.T) {
+	h := newHarness(t, false)
+	h.resize(120, 30) // 正常启动：拿到过有效尺寸
+
+	h.m.Update(tea.WindowSizeMsg{Width: 0, Height: 0}) // 收尾
+
+	if got := h.m.View().Content; got != "" {
+		t.Fatalf("收尾之后应当什么都不画，实得 %q", got)
+	}
 }

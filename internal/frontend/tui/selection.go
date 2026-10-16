@@ -88,14 +88,29 @@ func highlightRange(line string, lo, hi, cw int) string {
 //
 // 依赖上一次渲染记录的 lastTop：转录从视口顶部开始画，所以
 // 内容行 = lastTop + y。真实循环里渲染永远在输入之前，这个前提成立。
+//
+// **列要减去左栏宽度**：三栏之后 x 是整屏坐标，而选区用的是内容列。
+// 不减的话点正文最左边会算出 col=24 这种越界列，高亮会整块右移。
 func (m *Model) transcriptCaret(x, y int) selPos {
 	line := clamp(m.lastTop+y, 0, max(len(m.contentLines)-1, 0))
-	return selPos{line: line, col: max(x, 0)}
+	sw, _, _ := m.columns()
+	return selPos{line: line, col: max(x-sw, 0)}
 }
 
-// inTranscript 判断某屏幕坐标是否落在转录视口里（不含右侧滚动条列）。
+// inTranscript 判断某屏幕坐标是否落在转录视口里。
+//
+// 横向必须用**整屏坐标**判定（x 落在正文栏内）：contentW 是内容列宽、
+// 不含左栏偏移，在三栏下直接拿它比会差一个左栏宽度，表现为
+// "在左栏上拖拽也会选中正文"。
 func (m *Model) inTranscript(x, y int) bool {
-	return y >= 0 && y < m.viewportRows && x >= 0 && x < m.contentW
+	if y < 0 || y >= m.viewportRows {
+		return false
+	}
+	sw, bw, _ := m.columns()
+	if sw == 0 && bw >= m.width {
+		return x >= 0 && x < m.contentW // 单栏：与加栏前同一判定
+	}
+	return x >= sw && x < sw+m.contentW
 }
 
 // selectedText 取出当前选区的纯文本。

@@ -45,9 +45,13 @@ func TestInitReplaysRestoredHistory(t *testing.T) {
 
 // **尺寸到达之前不能渲染历史**：那时 m.width 是 0，折行会退回 20 列兜底宽度，
 // 表现就是"历史全挤在左边一条窄栏里"（实测被用户当场指出）。
+//
+// 窗口宽度取 180 而不是刚好够：180 列会进入三栏（左右各 42），
+// 正文栏剩 96 列——80 个显示列的历史仍必须是完整一行。
+// 也就是说这条用例顺带守住了"三栏之后正文宽度算对了"。
 func TestReplayWaitsForWindowSize(t *testing.T) {
 	h := newHarness(t, false)
-	// 40 个宽字符 = 80 显示列：装得进 120 列，装不进 20 列的兜底宽度
+	// 40 个宽字符 = 80 显示列：装得进正文栏，装不进 20 列的兜底宽度
 	long := strings.Repeat("宽", 40)
 	h.m.pendingReplay = []ReplayLine{{Role: "assistant", Content: long}}
 
@@ -56,12 +60,12 @@ func TestReplayWaitsForWindowSize(t *testing.T) {
 		t.Fatalf("尺寸未知时不该渲染历史：\n%s", out)
 	}
 
-	h.resize(120, 40)
+	h.resize(180, 40)
 
 	// 渲染出来后必须是**完整一行**，而不是被折成窄栏
 	out := h.allTranscript()
 	if !strings.Contains(out, long) {
-		t.Fatalf("历史应当按 120 列渲染成完整一行（不该折在 20 列里）：\n%s", out)
+		t.Fatalf("历史应当按正文宽度渲染成完整一行（不该折在 20 列里）：\n%s", out)
 	}
 
 	// 再收到尺寸消息也不该重复渲染

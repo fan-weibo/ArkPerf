@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -600,9 +601,10 @@ func devicesCmd() *cobra.Command {
 func tuiCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "tui",
-		Short: "全屏终端界面（原生滚动区转录 + 输入框 + 状态行）",
-		Long: "启动交互式终端界面：转录在上方视口，输入框钉在屏幕底边，agent 名字常驻左上。\n" +
-			"PageUp/PageDown 回看历史；输入 /help 看命令与按键。",
+		Short: "全屏终端界面（三栏：会话 / 对话 / 工作区文件）",
+		Long: "启动交互式终端界面：左栏是当前工作区的会话，中间是对话（转录 + 输入框 + 状态行），\n" +
+			"右栏是工作区文件树；终端够宽才三栏，窄了自动退回单栏。\n" +
+			"Ctrl+O 会话列表 · Ctrl+T 切换主题 · Ctrl+B / Ctrl+E 折叠左右栏；输入 /help 看全部命令与按键。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sess, err := app.Open(cmd.Context(), app.Options{
 				NoMCP:       flagNoMCP,
@@ -651,6 +653,10 @@ func tuiCmd() *cobra.Command {
 				ResetSession:     sess.NewSession,
 				StartupNotice:    notice,
 				InitialReplay:    initial,
+				// 右栏文件树：与 /sessions 同理，TUI 不碰文件系统。
+				// 遍历策略（跳过哪些目录、限几层、上限多少个节点）留在装配层，
+				// 那是策略而不是界面。
+				ListFiles: func() []tui.FileNode { return workspaceTree(sess.CWD()) },
 				// /sessions：列当前工作区的会话。TUI 不 import app，
 				// 所以在这一层把 app 的行/简报映射成 TUI 自己的类型。
 				Sessions: func() []tui.SessionBrief {
@@ -681,19 +687,12 @@ func tuiCmd() *cobra.Command {
 					}
 					return out, dir, nil
 				},
-				// /skills：用闭包而不是取一次固定值——工作目录会随 /cd 变，
-				// 而项目级技能就挂在 <工作目录>/.arkperf/skills 下
+				// /skills：用闭包而不是取一次固定值——工作目录会随跨工作区的
+				// 会话切换而变，而项目级技能就挂在 <工作目录>/.arkperf/skills 下
 				SkillReport:  func() string { return app.SkillReport(sess.CWD()) },
 				SkillSummary: sess.SkillSummary,
 				// /rules：审批规则的清单（含"怎么删"）
 				RulesReport: func() string { return app.ApprovalRulesSummary(sess.ApprovalRules()) },
-				// /cd：切工作目录，返回切换后的目录（失败如实抛出，让 TUI 显示原因）
-				SwitchWorkspace: func(path string) (string, error) {
-					if err := sess.SetWorkspace(path); err != nil {
-						return "", err
-					}
-					return sess.CWD(), nil
-				},
 				NewAgent: func(ap kernel.Approver, ev kernel.LoopEvents) tui.RunFunc {
 					return tui.RunFunc(sess.NewRunner(ap, ev))
 				},
@@ -708,3 +707,62 @@ func tuiCmd() *cobra.Command {
 
 // 工具链报告 / 设备报告已移到 internal/app：它们同时服务命令行子命令与
 // 各前端的 /check 与 /devices，放在装配层才能保证只有一份实现。
+
+// workspaceTree 列出工作区文件树，供 TUI 右栏展示。
+//
+// 限深度、限节点总数不是优化而是必需：一个 node_modules 就是十万级节点，
+// 而右栏只是导航视图——把它们全遍历一遍再渲染，滚动会直接卡住。
+// 隐藏项（.git / .env / .arkperf…）一并跳过：它们在导航里没有价值，
+// 却会在有限的行数里把真正要看的源码挤出去。
+func workspaceTree(root string) []tui.FileNode {
+	const (
+		maxDepth = 3
+		maxNodes = 400
+	)
+	// 这些目录名即使不是隐藏目录也要跳过（构建产物、依赖、缓存）
+	skip := map[string]bool{
+		"node_modules": true, "dist": true, "build": true, "out": true,
+		"vendor": true, "__pycache__": true, "target": true, "bin": true,
+	}
+	nodes := 0
+
+	var walk func(dir string, depth int) []tui.FileNode
+	walk = func(dir string, depth int) []tui.FileNode {
+		if depth > maxDepth || nodes >= maxNodes {
+			return nil
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			// 读不动（权限/已删除）就当空目录：右栏是导航，
+			// 不是错误报告的出口——不值得为它弹一行红字。
+			return nil
+		}
+		var dirs, files []tui.FileNode
+		for _, e := range entries {
+			if nodes >= maxNodes {
+				break
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, ".") || skip[name] {
+				continue
+			}
+			nodes++
+			rel, err := filepath.Rel(root, filepath.Join(dir, name))
+			if err != nil {
+				rel = name
+			}
+			rel = filepath.ToSlash(rel) // 统一成 /，Windows 上也能一眼看懂
+			if e.IsDir() {
+				dirs = append(dirs, tui.FileNode{
+					Name: name, Path: rel, IsDir: true,
+					Children: walk(filepath.Join(dir, name), depth+1),
+				})
+			} else {
+				files = append(files, tui.FileNode{Name: name, Path: rel})
+			}
+		}
+		// 目录在前、文件在后：导航树里的惯例，也让"折叠哪些目录"更好找
+		return append(dirs, files...)
+	}
+	return walk(root, 1)
+}

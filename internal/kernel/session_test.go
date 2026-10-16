@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSessionStoreRoundTrip(t *testing.T) {
@@ -181,5 +182,71 @@ func TestSessionStoreIDsAreUnique(t *testing.T) {
 			t.Fatalf("第 %d 次新建撞了 id：%s", i, id)
 		}
 		seen[id] = true
+	}
+}
+
+// 时间戳的语义：Updated 是"最后一次**对话推进**"，不是"最后一次被触碰"。
+//
+// 这里曾经是无条件刷新，而切换会话也会走 Save——于是侧栏显示的时间变成了
+// "你上次点开它的时间"，跟用户以为的"上次聊到哪儿"对不上（实测被问到）。
+// 下面两条把两种情形分开钉住。sleep 是必要的：两次 Save 挨得太近，
+// 时间精度可能不足以体现差异，那样测试会在"改了但看起来没改"时误判为通过。
+func TestSaveWithoutNewMessagesKeepsUpdated(t *testing.T) {
+	store := NewSessionStore(t.TempDir())
+	sess := store.New(`E:/proj/a`)
+	sess.Messages = []Message{msg("user", "q1"), msg("assistant", "a1")}
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	first := sess.Updated
+
+	time.Sleep(5 * time.Millisecond)
+
+	// 模拟"切过来看一眼"：重新读出来、再存一次，消息并没有变
+	loaded, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(loaded); err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Updated.Equal(first) {
+		t.Fatalf("没有新消息时不该刷新 Updated：%v → %v", first, loaded.Updated)
+	}
+}
+
+// 对话推进（追加了消息）必须刷新 Updated。
+func TestSaveWithNewMessagesRefreshesUpdated(t *testing.T) {
+	store := NewSessionStore(t.TempDir())
+	sess := store.New(`E:/proj/a`)
+	sess.Messages = []Message{msg("user", "q1")}
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	first := sess.Updated
+
+	time.Sleep(5 * time.Millisecond)
+	sess.Messages = append(sess.Messages, msg("assistant", "a1"))
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	if !sess.Updated.After(first) {
+		t.Fatalf("追加消息后应当刷新 Updated：%v → %v", first, sess.Updated)
+	}
+}
+
+// 空会话（还没聊过）反复落盘，时间应当停在创建时刻。
+func TestSaveEmptySessionKeepsCreatedTime(t *testing.T) {
+	store := NewSessionStore(t.TempDir())
+	sess := store.New(`E:/proj/a`)
+	created := sess.Created
+
+	time.Sleep(5 * time.Millisecond)
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	if !sess.Updated.Equal(created) {
+		t.Fatalf("空会话的时间应当是创建时间：created=%v updated=%v",
+			created, sess.Updated)
 	}
 }
