@@ -20,18 +20,19 @@ Release 包里已带便携 Python，解压即用；从源码运行才需要自�
 1. 从 [Releases](https://github.com/fan-weibo/ArkPerf/releases) 下载
    `ArkPerf-<版本>-windows-x64.zip`，**完整解压**到任意目录。
 
-2. 生成配置：
+2. 生成配置(在项目根目录终端运行命令)：
 
    ```bash
-   arkperf.exe init
+   arkperf.exe init     # 首次运行，生成配置（配置文件在 %USERPROFILE%\.arkperf\config.json）
    ```
 
-   它会打印解析到的 MCP 目录与 Python 解释器（都在解压目录里），并生成
-   `%USERPROFILE%\.arkperf\config.json`。重复运行不会覆盖已填的内容；
-   配置没填完时它会直接列出缺哪几项。
+3. 填模型信息（编辑上面那个 config.json 的 provider 段）：
 
-3. 填模型信息——编辑上面那个 `config.json` 的 provider 段：
-   `baseUrl`（OpenAI 兼容端点）/ `apiKey` / `model`。
+   ```bash
+   baseUrl OpenAI 兼容端点，例如 https://api.deepseek.com/v1
+   apiKey 你的密钥
+   model 模型名，例如 deepseek-chat
+   ```
 
 4. 自检：
 
@@ -46,10 +47,14 @@ Release 包里已带便携 Python，解压即用；从源码运行才需要自�
 5. 使用：
 
    ```bash
-   arkperf.exe tui
+   未将项目路径加入 PATH 时:
+      "包路径"/arkperf.exe tui
+
+   已将项目路径加入 PATH 时:
+      arkperf tui
    ```
 
-   建议把 arkperf.exe 所在目录加入 PATH 环境变量，便于使用。
+   建议把 `arkperf.exe` 所在目录加入 PATH 环境变量，便于使用。
 
 ## 从源码构建与运行
 
@@ -132,80 +137,3 @@ desktop/                桌面端外壳（Wails3 + Vue3）
 mcp-servers/            5 个 Python 服务：四类指标采集 + 一个聚合出报告
 skills/                 内置技能：与 mcp-servers/ 平级的随仓库分发数据
 ```
-
-## 技能（skill）
-
-技能是**按需加载的说明书**，与工具的分工是：工具给模型一双手（能做什么），
-技能给它一份手册（怎么把那双手用对）。
-
-只有技能的名字与描述进系统提示词，正文在模型判定任务相关后自己用 `read_file` 读。
-一个技能就是一个含 `SKILL.md` 的目录：
-
-```
-skills/cold-start-baseline/
-├── SKILL.md            # frontmatter + 正文，正文里可引用同目录的其他文件
-└── references/protocol.md
-```
-
-```markdown
----
-name: cold-start-baseline
-description: 建立冷启动耗时基线，并在改动后判定是否显著改善或退步。当用户问启动速度、冷启动优化效果时使用。
----
-
-正文：具体步骤与纪律……
-```
-
-- `name`：小写字母 / 数字 / 连字符，≤64 字符
-- `description`：≤1024 字符，**同时说清「做什么」与「什么时候用」**——
-  它是模型判断「要不要读这份技能」的唯一依据，写得含糊就等于这个技能不存在
-- frontmatter 只支持**单行值**；需要多行内容就放进正文
-
-三层目录，**越具体越赢**（同名时高优先级的那份生效）：
-
-| 层     | 位置                                       | 用途                 |
-| ------ | ------------------------------------------ | -------------------- |
-| 项目级 | `<工作区>/.arkperf/skills/<名字>/SKILL.md` | 某个工程专有的流程   |
-| 用户级 | `<状态根>/skills/<名字>/SKILL.md`          | 跨工程复用自己的技能 |
-| 内置   | 仓库根的 `skills/`                         | 随版本分发           |
-
-自己放的技能没生效时，先跑 `arkperf skills`：它会打出三层目录、每个技能的来源路径，
-以及被跳过的坏文件与原因（坏技能只跳过、不阻断，但会打一行 stderr）。
-
-## 运行时的三个默认行为
-
-**流式输出。** 模型的字边产边出，不是等整段说完。请求上带 `OnDelta` 就走流式，
-不带就走一次性路径——两种路径的返回值完全一致，上游不需要知道走的是哪条。
-思考过程（`reasoning_content`）与可见回答**分开回调**：TUI 只把思考字数显示在状态行，
-不进转录（思考往往比回答长一个数量级，全留下来会把结论冲得看不见）。
-
-**瞬时错误重试。** 网络层故障、408、429、5xx 按指数退避重试，最多 6 次；
-服务端给了 `Retry-After` 就听它的（钳制到 120 秒）。**其他 4xx 与本地超时不重试**——
-密钥错、模型名错这类确定性错误，重试一百次还是同样的错，只会让用户多等半分钟。
-流已经开始吐字之后中断**也不重试**，否则同一段话会再打一遍。
-
-**审批规则。** 危险工具默认每次询问。「这一类以后都不问」三个入口等价：
-TUI 审批卡上按 **A**（Shift+a）、桌面端审批卡上点**「这一类以后都不问」**按钮、
-CLI 加 `--yes`（后者是全自动批准，不落规则）。
-规则落在 `<状态根>/approved-rules.json`，下次启动继续生效。
-
-粒度是**保守**的：路径只归到目录、命令只归到「程序 + 子命令」，
-静态审批的域工具（build / install / launch 等）不参与记忆。
-
-> 规则只**减少询问**，不放宽任何红线：被硬拒的命令压根不进入审批路径
-> （`NeedsApproval` 恒为 false），所以规则也放行不了它们。
->
-> `arkperf rules` 或 TUI 里的 `/rules` 能看到自己放行了什么。删除目前只能手改文件。
-
-## 换机器 / 换克隆位置
-
-MCP 目录、Python 解释器与技能目录**不写死在代码里**，按以下顺序解析：
-
-| 目标         | 解析顺序                                                                                                                                                |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| MCP 目录     | `ARKPERF_MCP_DIR` → 可执行文件所在目录及其上两级下的 `mcp-servers` → 当前目录下的 `mcp-servers`                                                         |
-| Python       | `ARKPERF_PYTHON` → **可执行文件同级的 `python\python.exe`（发布包内置）** → 仓库根或 `mcp-servers` 下的 `.venv` → PATH 上的 `python` / `python3` / `py` |
-| 内置技能目录 | `ARKPERF_SKILLS_DIR` → 可执行文件所在目录及其上两级下的 `skills` → 当前目录下的 `skills`                                                                |
-
-解析结果会在 `arkperf init` 时打印出来；连不上 MCP 时先看那两行，
-技能没加载到就 `arkperf skills` 看它找了哪三个目录。

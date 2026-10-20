@@ -165,6 +165,14 @@ func TemplateConfig() *Config {
 func TemplateConfigFor(p TemplatePaths) *Config {
 	cfg := DefaultConfig()
 
+	// --- 新增：init 生成模板时带上默认 provider ---
+	cfg.Provider = ProviderConfig{
+		BaseURL: "URL占位符", // 占位符，提醒必须替换
+		APIKey:  "API占位符", // 占位符，提醒必须替换
+		Model:   "模型占位符",  // 占位符，提醒必须替换
+	}
+	// --------------------------------------------
+
 	server := func(script string) MCPServerConfig {
 		return MCPServerConfig{
 			Command: p.Python,
